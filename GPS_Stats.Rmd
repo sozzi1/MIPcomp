@@ -1,0 +1,2865 @@
+---
+title: "GPS_Stats"
+author: "Alessandro Sozzi"
+date: "2026-05-26"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  results = "hide"
+)
+library(tidyverse)
+library(readr)
+library(knitr)
+library(lme4)
+library(lmerTest)
+library(patchwork)
+library(gt)
+library(fitdistrplus)
+library(readxl)
+```
+
+## PCA — group summary from player exports
+
+Per-player PCA results in `Data_PCA` are combined into group-level PC summaries, a PC1 loadings-by-player figure, and a scree plot (mean eigenvalue ± SD across players).
+
+```{r pca_group_analysis, include=FALSE}
+source("E:/Work/R Projects/GPS/PCA_Group_Analysis.R")
+pca_group <- run_pca_group_analysis()
+```
+
+```{r pca_group_tables, results="asis"}
+htmltools::tagList(
+  htmltools::tags$p(
+    style = "text-align:center; font-style:italic; margin-bottom:0.5em;",
+    "Group-level PC summary across players. Variance explained shown as % (1 d.p.); eigenvalues to 2 d.p."
+  ),
+  pca_group$group_pc_table_gt
+)
+```
+
+```{r pca_pc1_loadings_fig, fig.width=10, fig.height=6, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(pca_group$plots$pc1_loadings)
+```
+
+```{r pca_group_scree_fig, fig.width=7, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(pca_group$plots$scree)
+```
+
+```{r load_mip_data, include=FALSE}
+tactical_path <- "E:/Work/R Projects/GPS/Data_Tactical/ALL_mip_tactical.csv"
+stats_dir <- "E:/Work/R Projects/GPS/Data_Stats"
+if (!dir.exists(stats_dir)) dir.create(stats_dir, recursive = TRUE)
+
+# Cohort: starters (sub = 0) or substitutes who came on strictly before 70:00.
+starter_early_sub_cutoff_min <- 70
+
+parse_mmss_to_min <- function(x) {
+  x <- str_remove(trimws(as.character(x)), "^'")
+  parts <- str_split(x, ":", simplify = TRUE)
+  if (ncol(parts) < 2) return(suppressWarnings(as.numeric(x)))
+  mm <- suppressWarnings(as.numeric(parts[, 1]))
+  ss <- suppressWarnings(as.numeric(parts[, 2]))
+  mm + ss / 60
+}
+
+filter_starter_early_sub <- function(df, cutoff_min = starter_early_sub_cutoff_min) {
+  df %>%
+    mutate(
+      .sub = as.integer(sub),
+      .sub_time_min = parse_mmss_to_min(sub_time)
+    ) %>%
+    filter(
+      .sub == 0L |
+        (!is.na(.sub_time_min) & .sub_time_min > 0 & .sub_time_min < cutoff_min)
+    ) %>%
+    select(-.sub, -.sub_time_min)
+}
+
+mip_interp_excl_path <- "E:/Work/R Projects/GPS/Exclusion_Data/ALL_mip_exclusion.csv"
+mip_interp_pct_max <- 15
+mip_interp_pct_run <- 10
+mip_interp_max_run <- 5
+
+filter_mip_interp_quality <- function(df, excl_path = mip_interp_excl_path) {
+  if (!file.exists(excl_path)) {
+    warning("MIP interpolation exclusion file not found: ", excl_path)
+    return(df)
+  }
+  excl <- read_csv(excl_path, show_col_types = FALSE) %>%
+    transmute(
+      match_id,
+      exclude_interp = pct_interpolated > mip_interp_pct_max |
+        (pct_interpolated > mip_interp_pct_run & max_consecutive_interpolated > mip_interp_max_run)
+    )
+  n_before <- nrow(df)
+  out <- df %>%
+    left_join(excl, by = "match_id") %>%
+    filter(is.na(exclude_interp) | !exclude_interp) %>%
+    select(-exclude_interp)
+  n_drop <- n_before - nrow(out)
+  if (n_drop > 0) {
+    cat(
+      "MIP GPS quality filter: dropped ", n_drop, " / ", n_before,
+      " rows (pct_interp > ", mip_interp_pct_max,
+      ", or pct_interp > ", mip_interp_pct_run,
+      " with max consecutive interp > ", mip_interp_max_run, ")\n",
+      sep = ""
+    )
+  }
+  out
+}
+
+mip_metrics <- c(
+  MIP_pc1_score = "MIP PC1 score",
+  MIP_TD_m = "Total distance (m)",
+  MIP_HSR_m = "HSR (m)",
+  MIP_AccelDist_m = "Accel distance (m)",
+  MIP_DecelDist_m = "Decel distance (m)"
+)
+
+position_group_map <- c(
+  RM = "W", LM = "W",
+  RW = "W", LW = "W",
+  RF = "F", LF = "F",
+  RCB = "CB", LCB = "CB",
+  RWB = "WB", LWB = "WB",
+  LCM = "CM", RCM = "CM",
+  WM = "W" # merge WM into W
+)
+
+tactical_raw <- read_csv(tactical_path, show_col_types = FALSE, na = c("", "NA", "N/A", "na"))
+all_mip_raw_n <- nrow(tactical_raw)
+
+all_mip <- tactical_raw %>%
+  select(
+    player_name, player_id, match_id, position, bip_time, sub, sub_time,
+    mip_start_in_match_mmss,
+    all_of(names(mip_metrics))
+  ) %>%
+  mutate(
+    match_date = substr(match_id, 1, 10),
+    position = str_trim(str_to_upper(as.character(position))),
+    bip_time = as.numeric(bip_time),
+    sub = as.integer(sub),
+    across(all_of(names(mip_metrics)), as.numeric),
+    position = recode(position, !!!position_group_map, .default = position),
+    half = case_when(
+      str_detect(match_id, regex("1st", ignore_case = TRUE)) ~ "1st Half",
+      str_detect(match_id, regex("2nd", ignore_case = TRUE)) ~ "2nd Half",
+      TRUE ~ NA_character_
+    ),
+    match_clock_min = parse_mmss_to_min(mip_start_in_match_mmss),
+    # mip_start_in_match_mmss is match clock (2nd half offset by +45:00)
+    time_in_half_min = if_else(half == "2nd Half", match_clock_min - 45, match_clock_min)
+  ) %>%
+  filter_starter_early_sub() %>%
+  filter_mip_interp_quality()
+
+cat(
+  "Cohort filter (starters or sub on < ",
+  starter_early_sub_cutoff_min,
+  " min): kept ",
+  nrow(all_mip),
+  " / ",
+  all_mip_raw_n,
+  " MIP rows\n",
+  sep = ""
+)
+
+missing_cols <- setdiff(names(mip_metrics), names(all_mip))
+if (length(missing_cols) > 0) {
+  stop("Missing MIP columns in ALL_mip_tactical.csv: ", paste(missing_cols, collapse = ", "))
+}
+
+tactical_action_cols <- c(
+  "pressing", "interception", "covering", "recovery run", "penetrate box",
+  "attack space behind", "over/underlap", "carry ball", "push up pitch", "move to receive"
+)
+
+tactical_individual_metrics <- c(
+  pressing = "Pressing",
+  interception = "Interception",
+  covering = "Covering",
+  `recovery run` = "Recovery run",
+  `penetrate box` = "Penetrate box",
+  `attack space behind` = "Attack space behind",
+  `over/underlap` = "Over/underlap",
+  `carry ball` = "Carry ball",
+  `push up pitch` = "Push up pitch",
+  `move to receive` = "Move to receive"
+)
+
+tactical_phase_metrics <- c(
+  `Long Ball` = "Long Ball",
+  `Attacking Transition` = "Attacking Transition",
+  `Counter Press` = "Counter Press",
+  `Defensive Transition` = "Defensive Transition"
+)
+
+all_tactical <- tactical_raw %>%
+  select(
+    player_name, player_id, match_id, position, bip_time, sub, sub_time,
+    mip_start_in_match_mmss, mip_end_in_match_mmss,
+    all_of(tactical_action_cols),
+    IP1, IP2, IP3, OOP1, OOP2, OOP3,
+    `Long Ball`, `Attacking Transition`, `Defensive Transition`, `Counter Press`
+  ) %>%
+  mutate(
+    position = str_trim(str_to_upper(as.character(position))),
+    bip_time = as.numeric(bip_time),
+    sub = as.integer(sub),
+    across(all_of(c(
+      tactical_action_cols, "IP1", "IP2", "IP3", "OOP1", "OOP2", "OOP3",
+      "Long Ball", "Attacking Transition", "Defensive Transition", "Counter Press"
+    )), as.numeric),
+    position = recode(position, !!!position_group_map, .default = position),
+    match_date = substr(match_id, 1, 10),
+    phase_of_play = IP1 + IP2 + IP3 + OOP1 + OOP2 + OOP3
+  ) %>%
+  filter_starter_early_sub() %>%
+  filter_mip_interp_quality()
+```
+
+```{r mip_desc_functions, include=FALSE}
+summarise_mip_metrics <- function(data) {
+  map_dfr(names(mip_metrics), function(var) {
+    x <- data[[var]]
+    tibble(
+      metric = mip_metrics[[var]],
+      variable = var,
+      n = sum(!is.na(x)),
+      mean = mean(x, na.rm = TRUE),
+      sd = sd(x, na.rm = TRUE)
+    )
+  }) %>%
+    mutate(
+      mean = round(mean, 1),
+      sd = round(sd, 1)
+    )
+}
+
+format_mean_sd <- function(mean, sd) {
+  sprintf("%.1f (%.1f)", mean, sd)
+}
+
+format_p_value <- function(p) {
+  case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.05 ~ "<0.05",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+position_order <- c("CB", "WB", "CM", "CAM", "F", "W", "ST")
+position_min_n <- 2L
+
+position_display <- c(
+  CB = "Centre back",
+  WB = "Wing back",
+  CM = "Central midfielder",
+  CAM = "Attacking midfielder",
+  W = "Winger",
+  F = "Forward",
+  ST = "Striker"
+)
+
+positions_with_min_n <- function(data, min_n = position_min_n) {
+  data %>%
+    filter(!is.na(position), position != "", position != "0") %>%
+    count(position, name = "n") %>%
+    filter(n >= min_n) %>%
+    pull(position)
+}
+
+filter_positions_min_n <- function(data, min_n = position_min_n) {
+  keep <- positions_with_min_n(data, min_n)
+  data %>%
+    filter(position %in% keep) %>%
+    mutate(position = factor(position, levels = intersect(position_order, keep)))
+}
+
+build_tactic_count_heatmap <- function(
+  data,
+  metric_cols,
+  metric_labels = NULL,
+  title,
+  subtitle,
+  y_label = "Count per 3-min MIP",
+  save_path = NULL
+) {
+  if (is.null(metric_labels)) {
+    metric_labels <- setNames(metric_cols, metric_cols)
+  }
+
+  plot_input <- data %>%
+    filter(
+      !is.na(position), position != "", position != "0",
+      complete.cases(pick(all_of(metric_cols)))
+    ) %>%
+    filter_positions_min_n() %>%
+    mutate(across(all_of(metric_cols), as.integer))
+
+  freq_max <- plot_input %>%
+    select(all_of(metric_cols)) %>%
+    pivot_longer(everything(), values_to = "frequency") %>%
+    pull(frequency) %>%
+    max(na.rm = TRUE)
+  if (!is.finite(freq_max) || freq_max < 0) freq_max <- 0L
+
+  heatmap_data <- plot_input %>%
+    select(position, all_of(metric_cols)) %>%
+    pivot_longer(-position, names_to = "metric", values_to = "frequency") %>%
+    mutate(frequency = as.integer(frequency)) %>%
+    count(position, metric, frequency, name = "count")
+
+  position_labels <- plot_input %>%
+    count(position, name = "n") %>%
+    mutate(
+      position = as.character(position),
+      position_label = paste0(
+        recode(position, !!!position_display, .default = position),
+        " (n=", n, ")"
+      )
+    ) %>%
+    arrange(factor(position, levels = position_order))
+
+  plot_df <- expand_grid(
+    position = position_labels$position,
+    metric = metric_cols,
+    frequency = seq(0L, freq_max)
+  ) %>%
+    left_join(heatmap_data, by = c("position", "metric", "frequency")) %>%
+    mutate(
+      count = replace_na(count, 0L),
+      metric = factor(metric, levels = metric_cols),
+      metric_label = recode(as.character(metric), !!!metric_labels),
+      frequency = factor(frequency, levels = seq(0L, freq_max)),
+      position_label = recode(
+        position,
+        !!!setNames(position_labels$position_label, position_labels$position)
+      ),
+      position_label = factor(
+        position_label,
+        levels = position_labels$position_label
+      )
+    ) %>%
+    group_by(position_label) %>%
+    mutate(
+      fill_prop = if (max(count, na.rm = TRUE) > 0) {
+        count / max(count, na.rm = TRUE)
+      } else {
+        0
+      }
+    ) %>%
+    ungroup()
+
+  p <- ggplot(plot_df, aes(x = metric_label, y = frequency, fill = fill_prop)) +
+    geom_tile(color = "white", linewidth = 0.25) +
+    geom_text(aes(label = count), size = 2.6, color = "grey15") +
+    scale_fill_gradientn(
+      colours = c("#f7fbff", "#c8e1f6", "#7ec0ef", "#52A8E8"),
+      limits = c(0, 1),
+      labels = scales::percent,
+      name = "Relative to position max"
+    ) +
+    scale_y_discrete(drop = FALSE) +
+    facet_wrap(~ position_label, ncol = 2) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = NULL,
+      y = y_label
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      panel.grid = element_blank(),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+
+  if (!is.null(save_path)) {
+    ggsave(save_path, p, width = 10, height = 12, dpi = 180, bg = "white")
+  }
+
+  p
+}
+
+# Pitch layout (157.5 x 163.2 m, attacking upward — width +20%, length +50%).
+# Flank columns: WB → W (former WM merged into W). Centre stack: CB → CM → CAM → F → ST.
+position_pitch_zones <- bind_rows(
+  tibble(position = "CB", xmin = 45, xmax = 112.5, ymin = 0, ymax = 48),
+  tibble(position = "WB", xmin = 0, xmax = 45, ymin = 0, ymax = 112.4),
+  tibble(position = "WB", xmin = 112.5, xmax = 157.5, ymin = 0, ymax = 112.4),
+  tibble(position = "CM", xmin = 45, xmax = 112.5, ymin = 48, ymax = 81.6),
+  tibble(position = "CAM", xmin = 45, xmax = 112.5, ymin = 81.6, ymax = 112.4),
+  tibble(position = "F", xmin = 22.5, xmax = 135, ymin = 112.4, ymax = 163.2),
+  tibble(position = "W", xmin = 0, xmax = 45, ymin = 81.6, ymax = 163.2),
+  tibble(position = "W", xmin = 112.5, xmax = 157.5, ymin = 81.6, ymax = 163.2),
+  tibble(position = "ST", xmin = 51.75, xmax = 106.75, ymin = 135.2, ymax = 163.2)
+) %>%
+  mutate(
+    position = factor(position, levels = position_order),
+    x_center = (xmin + xmax) / 2,
+    y_center = (ymin + ymax) / 2
+  )
+
+pitch_dims <- list(w = 157.5, h = 163.2, cx = 78.75, cy = 81.6)
+
+pitch_bg_layer <- function() {
+  annotate(
+    "rect",
+    xmin = 0, xmax = pitch_dims$w, ymin = 0, ymax = pitch_dims$h,
+    fill = "#ececec", color = NA
+  )
+}
+
+pitch_marking_layers <- function() {
+  w <- pitch_dims$w
+  h <- pitch_dims$h
+  cx <- pitch_dims$cx
+  cy <- pitch_dims$cy
+  pen_w <- 55
+  pen_d <- 28
+  goal_w <- 36
+  goal_d <- 11
+  line_col <- alpha("#FFFFFF", 0.8)
+  theta <- seq(0, 2 * pi, length.out = 200)
+  center_circle <- tibble(
+    x = cx + 18.3 * cos(theta),
+    y = cy + 18.3 * sin(theta)
+  )
+
+  list(
+    annotate(
+      "rect", xmin = 0, xmax = w, ymin = 0, ymax = h,
+      fill = NA, color = line_col, linewidth = 0.65
+    ),
+    annotate(
+      "segment", x = 0, y = cy, xend = w, yend = cy,
+      color = line_col, linewidth = 0.65
+    ),
+    geom_path(
+      data = center_circle, aes(x, y),
+      color = line_col, linewidth = 0.65, inherit.aes = FALSE
+    ),
+    annotate(
+      "rect",
+      xmin = cx - pen_w / 2, xmax = cx + pen_w / 2,
+      ymin = 0, ymax = pen_d,
+      fill = NA, color = line_col, linewidth = 0.65
+    ),
+    annotate(
+      "rect",
+      xmin = cx - goal_w / 2, xmax = cx + goal_w / 2,
+      ymin = 0, ymax = goal_d,
+      fill = NA, color = line_col, linewidth = 0.65
+    ),
+    annotate(
+      "rect",
+      xmin = cx - pen_w / 2, xmax = cx + pen_w / 2,
+      ymin = h - pen_d, ymax = h,
+      fill = NA, color = line_col, linewidth = 0.65
+    ),
+    annotate(
+      "rect",
+      xmin = cx - goal_w / 2, xmax = cx + goal_w / 2,
+      ymin = h - goal_d, ymax = h,
+      fill = NA, color = line_col, linewidth = 0.65
+    ),
+    annotate("point", x = cx, y = cy, size = 1, color = line_col),
+    annotate("point", x = cx, y = 22, size = 1, color = line_col),
+    annotate("point", x = cx, y = h - 22, size = 1, color = line_col)
+  )
+}
+
+plot_pitch_tactical_heatmap <- function(df, title, fill_high = "#E30613", font_col = "grey15") {
+  fill_max <- max(df$mean_count, na.rm = TRUE)
+  if (!is.finite(fill_max) || fill_max <= 0) fill_max <- 1
+
+  # Light tint of the action colour for the low end of the shade scale
+  low_col <- colorRampPalette(c("white", fill_high))(10)[2]
+  cx <- pitch_dims$cx
+
+  # Position-specific marker shapes (see layout): wide pill (CB), tall pills
+  # (WB, both flanks), ellipses (CM, CAM), crescent (F), circle (ST); any
+  # other position (e.g. W) falls back to a circle at its zone centre.
+  ell <- function(cx, cy, a, b, n = 90) {
+    t <- seq(0, 2 * pi, length.out = n)
+    tibble(x = cx + a * cos(t), y = cy + b * sin(t))
+  }
+  stad <- function(cx, cy, half_len, r, horizontal = TRUE, n = 40) {
+    s <- max(half_len - r, 0)
+    if (horizontal) {
+      t1 <- seq(-pi / 2, pi / 2, length.out = n)
+      t2 <- seq(pi / 2, 3 * pi / 2, length.out = n)
+      bind_rows(
+        tibble(x = cx + s + r * cos(t1), y = cy + r * sin(t1)),
+        tibble(x = cx - s + r * cos(t2), y = cy + r * sin(t2))
+      )
+    } else {
+      u1 <- seq(0, pi, length.out = n)
+      u2 <- seq(pi, 2 * pi, length.out = n)
+      bind_rows(
+        tibble(x = cx + r * cos(u1), y = cy + s + r * sin(u1)),
+        tibble(x = cx + r * cos(u2), y = cy - s + r * sin(u2))
+      )
+    }
+  }
+  # Crescent (banana) with rounded end caps
+  rounded_crescent <- function(cx, cy_arc, R, thick, ang1, ang2, n = 70, ncap = 24) {
+    r <- thick / 2
+    t <- seq(ang1, ang2, length.out = n)
+    outer <- tibble(x = cx + (R + r) * cos(t), y = cy_arc + (R + r) * sin(t))
+    inner <- tibble(x = cx + (R - r) * cos(rev(t)), y = cy_arc + (R - r) * sin(rev(t)))
+    rad2 <- c(cos(ang2), sin(ang2)); tan2 <- c(-sin(ang2), cos(ang2))
+    C2 <- c(cx + R * cos(ang2), cy_arc + R * sin(ang2))
+    ph <- seq(0, pi, length.out = ncap)
+    cap2 <- tibble(
+      x = C2[1] + r * (cos(ph) * rad2[1] + sin(ph) * tan2[1]),
+      y = C2[2] + r * (cos(ph) * rad2[2] + sin(ph) * tan2[2])
+    )
+    rad1 <- c(cos(ang1), sin(ang1)); tan1 <- c(-sin(ang1), cos(ang1))
+    C1 <- c(cx + R * cos(ang1), cy_arc + R * sin(ang1))
+    ph2 <- seq(pi, 0, length.out = ncap)
+    cap1 <- tibble(
+      x = C1[1] + r * (cos(ph2) * rad1[1] - sin(ph2) * tan1[1]),
+      y = C1[2] + r * (cos(ph2) * rad1[2] - sin(ph2) * tan1[2])
+    )
+    bind_rows(outer, cap2, inner, cap1)
+  }
+
+  make_marker <- function(pos, xc, yc, mc, pid) {
+    shape <- switch(as.character(pos),
+      "CB"  = stad(cx, 20, 40, 12, TRUE),
+      "CM"  = ell(cx, 56, 34, 15),
+      "CAM" = ell(cx, 90, 26, 15),
+      "F"  = rounded_crescent(cx, 172, 52, 20, 245 * pi / 180, 295 * pi / 180),
+      "ST"  = ell(cx, 150, 13, 13),
+      "WB"  = ell(xc, 78, 15, 45),
+      ell(xc, yc, 13, 13)
+    )
+    shape %>% mutate(position = as.character(pos), mean_count = mc, pid = pid)
+  }
+
+  rows <- df %>% mutate(pid = row_number())
+  poly_df <- pmap_dfr(
+    list(rows$position, rows$x_center, rows$y_center, rows$mean_count, rows$pid),
+    make_marker
+  )
+
+  # Label anchor per marker; text switches to white on darker fills
+  label_df <- rows %>%
+    mutate(
+      pos = as.character(position),
+      lx = if_else(pos %in% c("WB", "W"), x_center, cx),
+      ly = dplyr::case_when(
+        pos == "CB" ~ 20, pos == "CM" ~ 56, pos == "CAM" ~ 90,
+        pos == "F" ~ 120, pos == "ST" ~ 150, pos == "WB" ~ 78,
+        TRUE ~ y_center
+      )
+    )
+
+  ggplot() +
+    pitch_bg_layer() +
+    pitch_marking_layers() +
+    geom_polygon(
+      data = poly_df,
+      aes(x = x, y = y, group = pid, fill = mean_count),
+      colour = "grey15",
+      linewidth = 0.4
+    ) +
+    geom_text(
+      data = label_df,
+      aes(
+        x = lx, y = ly,
+        label = paste0(position, "\n", sprintf("%.1f", mean_count))
+      ),
+      colour = font_col,
+      size = 4,
+      fontface = "bold",
+      lineheight = 0.85
+    ) +
+    scale_fill_gradient(
+      low = low_col,
+      high = fill_high,
+      limits = c(0, fill_max),
+      name = "Mean count"
+    ) +
+    coord_fixed(ratio = pitch_dims$h / pitch_dims$w, xlim = c(-3, 160.5), ylim = c(-4, 167.2), clip = "off") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_void(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, margin = margin(b = 4)),
+      legend.position = "right",
+      plot.margin = margin(4, 4, 4, 4),
+      panel.background = element_rect(fill = "#ececec", color = NA)
+    )
+}
+
+# Y-position for context third labels: clear penalty-area lines and halfway line.
+context_third_label_y <- function(third, h, cy, pen_d = 28) {
+  dplyr::case_when(
+    third == 1L ~ (pen_d + h / 3) / 2,
+    third == 2L ~ cy + 5,
+    third == 3L ~ (2 * h / 3 + (h - pen_d)) / 2,
+    TRUE ~ (third - 0.5) * h / 3
+  )
+}
+
+# Context heatmap: full pitch shaded by thirds (one phase: IP or OOP).
+#   df: columns third (1 = own/defensive ... 3 = attacking), value (0-1 share).
+plot_pitch_context_full <- function(df, title, fill_high = "#1B3A6B", fill_max = NULL,
+                                    font_col = "white", label_size = 4, title_size = 11,
+                                    show_legend = TRUE) {
+  h <- pitch_dims$h
+  cx <- pitch_dims$cx
+  cy <- pitch_dims$cy
+  pen_d <- 28
+  if (is.null(fill_max) || !is.finite(fill_max) || fill_max <= 0) fill_max <- max(df$value, na.rm = TRUE)
+  low_col <- colorRampPalette(c("white", fill_high))(10)[2]
+
+  zdf <- df %>%
+    mutate(
+      ymin = (third - 1) * h / 3,
+      ymax = third * h / 3,
+      ylab = context_third_label_y(third, h, cy, pen_d)
+    )
+
+  ggplot() +
+    pitch_bg_layer() +
+    geom_rect(
+      data = zdf,
+      aes(xmin = 0, xmax = pitch_dims$w, ymin = ymin, ymax = ymax, fill = value)
+    ) +
+    pitch_marking_layers() +
+    geom_text(
+      data = zdf,
+      aes(x = cx, y = ylab, label = sprintf("%.0f%%", 100 * value)),
+      colour = font_col,
+      size = label_size,
+      fontface = "bold",
+      lineheight = 0.9
+    ) +
+    scale_fill_gradient(
+      low = low_col,
+      high = fill_high,
+      limits = c(0, fill_max),
+      labels = scales::percent,
+      name = "Share of phase-of-play time"
+    ) +
+    coord_fixed(ratio = pitch_dims$h / pitch_dims$w, xlim = c(-3, 160.5), ylim = c(-4, 167.2), clip = "off") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_void(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = title_size, margin = margin(b = 6)),
+      legend.position = if (show_legend) "bottom" else "none",
+      plot.margin = margin(6, 6, 6, 6),
+      panel.background = element_rect(fill = "#ececec", color = NA)
+    )
+}
+
+# Context heatmap: ONE pitch split left (IP) / right (OOP) — used for per-position panels.
+# each half shaded by thirds. Both halves share one colour gradient.
+#   zdf: columns side ("IP"/"OOP"), third (1 = own/defensive ... 3 = attacking),
+#        name (e.g. "IP1"), value (0-1 share of phase-of-play time).
+plot_pitch_context_split <- function(zdf, title, fill_high = "#1B3A6B", fill_max = NULL,
+                                      font_col = "white", label_size = 4, head_size = 4.3,
+                                      title_size = 11, show_legend = TRUE) {
+  w <- pitch_dims$w
+  h <- pitch_dims$h
+  cx <- pitch_dims$cx
+  cy <- pitch_dims$cy
+  if (is.null(fill_max) || !is.finite(fill_max) || fill_max <= 0) fill_max <- max(zdf$value, na.rm = TRUE)
+  low_col <- colorRampPalette(c("white", fill_high))(10)[2]
+
+  zdf <- zdf %>%
+    mutate(
+      xmin = if_else(side == "IP", 0, cx),
+      xmax = if_else(side == "IP", cx, w),
+      ymin = (third - 1) * h / 3,
+      ymax = third * h / 3,
+      xc = (xmin + xmax) / 2,
+      yc = (ymin + ymax) / 2,
+      ylab = if_else(third == 2L, cy + 5, yc)
+    )
+
+  head_df <- tibble(
+    x = c(cx / 2, cx + cx / 2),
+    y = h + 8,
+    lab = c("In possession", "Out of possession")
+  )
+
+  ggplot() +
+    pitch_bg_layer() +
+    geom_rect(
+      data = zdf,
+      aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = value)
+    ) +
+    pitch_marking_layers() +
+    annotate("segment", x = cx, xend = cx, y = 0, yend = h, colour = "white", linewidth = 1.1) +
+    geom_text(
+      data = zdf,
+      aes(x = xc, y = ylab, label = sprintf("%.0f%%", 100 * value)),
+      colour = font_col,
+      size = label_size,
+      fontface = "bold",
+      lineheight = 0.9
+    ) +
+    geom_text(data = head_df, aes(x = x, y = y, label = lab), fontface = "bold", size = head_size) +
+    scale_fill_gradient(
+      low = low_col,
+      high = fill_high,
+      limits = c(0, fill_max),
+      labels = scales::percent,
+      name = "Share of phase-of-play time"
+    ) +
+    coord_fixed(ratio = pitch_dims$h / pitch_dims$w, xlim = c(-3, 160.5), ylim = c(-4, 175), clip = "off") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_void(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = title_size, margin = margin(b = 6)),
+      legend.position = if (show_legend) "bottom" else "none",
+      plot.margin = margin(6, 6, 6, 6),
+      panel.background = element_rect(fill = "#ececec", color = NA)
+    )
+}
+
+tidy_lmer_fixed <- function(model) {
+  sm <- as.data.frame(coef(summary(model)))
+  # Column layout differs by engine:
+  #   lmer (lmerTest): Estimate, Std.Error, df, t, Pr(>|t|)  -> 5 cols
+  #   glmer:           Estimate, Std.Error, z, Pr(>|z|)      -> 4 cols
+  #   lmer (no lmerTest): Estimate, Std.Error, t            -> 3 cols
+  out <- data.frame(
+    estimate = sm[[1]],
+    std.error = sm[[2]],
+    stringsAsFactors = FALSE
+  )
+  if (ncol(sm) >= 5) {
+    out$statistic <- sm[[4]]
+    out$p.value <- sm[[5]]
+  } else if (ncol(sm) == 4) {
+    out$statistic <- sm[[3]]
+    out$p.value <- sm[[4]]
+  } else if (ncol(sm) == 3) {
+    out$statistic <- sm[[3]]
+    out$p.value <- NA_real_
+  } else {
+    out$statistic <- NA_real_
+    out$p.value <- NA_real_
+  }
+  out$term <- rownames(sm)
+  rownames(out) <- NULL
+
+  ci <- tryCatch(
+    as.data.frame(confint(model, parm = "beta_", method = "Wald")),
+    error = function(e) NULL
+  )
+  if (!is.null(ci)) {
+    ci$term <- rownames(ci)
+    rownames(ci) <- NULL
+    names(ci)[1:2] <- c("conf.low", "conf.high")
+    out <- left_join(out, ci[, c("term", "conf.low", "conf.high")], by = "term")
+  } else {
+    out$conf.low <- out$estimate - 1.96 * out$std.error
+    out$conf.high <- out$estimate + 1.96 * out$std.error
+  }
+  out
+}
+
+# Marginal means by position on the link scale; back-transform when link = "log"
+# (Gamma GLMM or lognormal LMM) to report response-scale means.
+lmer_pos_emmeans <- function(model, pos_levels, link = "identity") {
+  nd <- tibble(position = factor(pos_levels, levels = pos_levels))
+  X <- model.matrix(~ position, data = nd)
+  beta <- fixef(model)[colnames(X)]
+  V <- as.matrix(vcov(model))[colnames(X), colnames(X), drop = FALSE]
+  est <- as.numeric(X %*% beta)
+  se <- sqrt(rowSums((X %*% V) * X))
+  lo <- est - 1.96 * se
+  hi <- est + 1.96 * se
+  if (identical(link, "log")) {
+    est <- exp(est)
+    lo <- exp(lo)
+    hi <- exp(hi)
+  }
+  nd %>%
+    mutate(estimate = est, conf.low = lo, conf.high = hi)
+}
+
+lme_var <- function(var) {
+  if (str_detect(var, "^`|\\s|/")) paste0("`", var, "`") else var
+}
+
+# Crossed random intercepts for physical and tactical mixed models
+lme_random_rhs <- "(1 | player_name) + (1 | match_date)"
+
+run_position_lme_analysis <- function(data, metrics, title_tag, file_prefix, plot_style = c("jitter", "heatmap")) {
+  plot_style <- match.arg(plot_style)
+  lme_data <- data %>%
+    filter(
+      !is.na(position), position != "", position != "0",
+      complete.cases(pick(all_of(names(metrics))))
+    ) %>%
+    filter_positions_min_n()
+
+  fit_one <- function(outcome_var, d) {
+    fml <- as.formula(paste(lme_var(outcome_var), "~ position +", lme_random_rhs))
+    lmer(fml, data = d, REML = TRUE)
+  }
+
+  models <- setNames(lapply(names(metrics), function(v) fit_one(v, lme_data)), names(metrics))
+
+  omnibus <- map_dfr(names(metrics), function(v) {
+    fml1 <- as.formula(paste(lme_var(v), "~ position +", lme_random_rhs))
+    fml0 <- as.formula(paste(lme_var(v), "~ 1 +", lme_random_rhs))
+    m0 <- lmer(fml0, data = lme_data, REML = FALSE)
+    m1 <- lmer(fml1, data = lme_data, REML = FALSE)
+    cmp <- anova(m0, m1)
+    tibble(outcome = metrics[[v]], outcome_var = v, p.value = cmp$`Pr(>Chisq)`[2])
+  })
+
+  coef <- map_dfr(names(metrics), function(v) {
+    tidy_lmer_fixed(models[[v]]) %>%
+      filter(str_detect(term, "^position")) %>%
+      mutate(
+        position = str_remove(term, "^position"),
+        outcome_var = v,
+        outcome = metrics[[v]]
+      )
+  }) %>%
+    select(outcome, outcome_var, position, estimate, std.error, statistic, p.value, conf.low, conf.high)
+
+  emmeans <- map_dfr(names(metrics), function(v) {
+    lmer_pos_emmeans(models[[v]], levels(lme_data$position)) %>%
+      mutate(outcome_var = v, outcome = metrics[[v]])
+  })
+
+  fit_stats <- map_dfr(names(metrics), function(v) {
+    m <- models[[v]]
+    g <- ngrps(m)
+    tibble(
+      outcome = metrics[[v]],
+      outcome_var = v,
+      n_obs = nobs(m),
+      n_players = as.integer(g[["player_name"]]),
+      n_matches = as.integer(g[["match_date"]]),
+      AIC = AIC(m)
+    )
+  })
+
+  write_csv(omnibus, file.path(stats_dir, paste0(file_prefix, "_position_lme_omnibus.csv")))
+  write_csv(coef, file.path(stats_dir, paste0(file_prefix, "_position_lme_coefficients_vs_cb.csv")))
+  write_csv(emmeans, file.path(stats_dir, paste0(file_prefix, "_position_lme_emmeans.csv")))
+  write_csv(fit_stats, file.path(stats_dir, paste0(file_prefix, "_position_lme_fit_stats.csv")))
+
+  p_omnibus <- omnibus %>%
+    mutate(
+      outcome = fct_reorder(outcome, -log10(p.value)),
+      sig = if_else(p.value < 0.05, "p < 0.05", "n.s.")
+    ) %>%
+    ggplot(aes(x = -log10(p.value), y = outcome, colour = sig)) +
+    geom_vline(xintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+    geom_point(size = 3) +
+    scale_colour_manual(values = c("p < 0.05" = "#C0392B", "n.s." = "grey40")) +
+    labs(
+      title = paste0("Playing position vs 3-minute MIP tactical — ", title_tag),
+      subtitle = "Omnibus LRT for position (reference: CB) | random intercepts: player + match",
+      x = expression(-log[10](p)),
+      y = NULL,
+      colour = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom")
+
+  obs_long <- lme_data %>%
+    pivot_longer(all_of(names(metrics)), names_to = "outcome_var", values_to = "value") %>%
+    mutate(outcome = metrics[outcome_var])
+
+  position_mean_counts <- lme_data %>%
+    pivot_longer(all_of(names(metrics)), names_to = "outcome_var", values_to = "value") %>%
+    group_by(position, outcome_var) %>%
+    summarise(
+      mean_count = mean(value, na.rm = TRUE),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(outcome = metrics[outcome_var])
+
+  write_csv(
+    position_mean_counts %>%
+      select(outcome, outcome_var, position, n, mean_count),
+    file.path(stats_dir, paste0(file_prefix, "_position_mean_counts.csv"))
+  )
+
+  n_out <- length(metrics)
+
+  # Heatmap: hm_scale doubles ggsave inches + knitr fig chunk so pitches match coord_fixed aspect.
+  hm_scale <- if (plot_style == "heatmap") 2 else 1
+
+  if (plot_style == "heatmap") {
+    # One colour per action, interpolated across the brand palette anchors
+    brand_anchor <- c("#005EB8", "#F39200", "#E30613", "#009640", "#101820")
+    action_palette <- setNames(
+      colorRampPalette(brand_anchor)(length(metrics)),
+      names(metrics)
+    )
+    heatmap_plots <- map(names(metrics), function(v) {
+      df <- position_mean_counts %>%
+        filter(outcome_var == v) %>%
+        left_join(position_pitch_zones, by = "position")
+      font_col <- if (v == "move to receive") "white" else "grey15"
+      plot_pitch_tactical_heatmap(
+        df,
+        title = metrics[[v]],
+        fill_high = action_palette[[v]],
+        font_col = font_col
+      )
+    })
+    p_means <- wrap_plots(heatmap_plots, ncol = 2) +
+      plot_annotation(
+        title = paste0("Mean tactical counts by position (pitch heatmap) — ", title_tag),
+        subtitle = "Marker shade = low → high mean count in the 3-minute MIP; one colour & pitch per action",
+        theme = theme(
+          plot.title = element_text(face = "bold", size = 12),
+          plot.subtitle = element_text(size = 10)
+        )
+      ) +
+      plot_layout(guides = "collect") &
+      theme(legend.position = "right")
+    fig_h <- max(3, ceiling(n_out / 2) * 1.35)
+  } else {
+    emm_long <- emmeans %>%
+      mutate(
+        outcome = metrics[outcome_var],
+        position = factor(position, levels = levels(lme_data$position))
+      )
+
+    p_means <- ggplot(obs_long, aes(x = position, y = value)) +
+      geom_jitter(width = 0.15, height = 0, alpha = 0.35, size = 1.4, colour = "grey35") +
+      geom_pointrange(
+        data = emm_long,
+        aes(x = position, y = estimate, ymin = conf.low, ymax = conf.high),
+        colour = "#2980B9",
+        linewidth = 0.7,
+        fatten = 2.5,
+        inherit.aes = FALSE
+      ) +
+      facet_wrap(~ outcome, scales = "free_y", ncol = 2) +
+      labs(
+        title = paste0("3-minute MIP outcomes by position — ", title_tag),
+        subtitle = "Points = observations; blue = LMM marginal mean ± 95% CI (player + match RE = 0)",
+        x = "Position",
+        y = "Tactical count in MIP window"
+      ) +
+      theme_minimal(base_size = 10) +
+      theme(
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      )
+    fig_h <- max(2.4, ceiling(n_out / 2) * 1.2)
+  }
+
+  fig <- p_omnibus / p_means + plot_layout(heights = c(1, fig_h))
+
+  ggsave(
+    file.path(stats_dir, paste0(file_prefix, "_position_lme_figure.png")),
+    fig,
+    width = 11 * hm_scale,
+    height = (8 + fig_h * 2) * hm_scale,
+    dpi = 180,
+    bg = "white",
+    limitsize = FALSE
+  )
+
+  list(
+    omnibus = omnibus,
+    coef = coef,
+    emmeans = emmeans,
+    fit_stats = fit_stats,
+    position_mean_counts = position_mean_counts,
+    fig = fig
+  )
+}
+```
+
+All analyses below use **starters** (`sub = 0`) and **substitutes who entered before 70:00** (`sub_time` strictly before 70 minutes). Late substitutes are excluded. MIPs are also excluded when GPS interpolation within the 3-minute window exceeds quality thresholds: **pct_interpolated &gt; 15%**, or **pct_interpolated &gt; 10%** with **max_consecutive_interpolated &gt; 5** (see `Exclusion_Data/ALL_mip_exclusion.csv`). Position-stratified results drop any position with **n &lt; 2** observations.
+
+### MIP outcomes by match time
+
+Scatter of all filtered MIP observations against match clock (minutes), shown separately for 1st half (0–45) and 2nd half (45–90). One randomly selected match with at least 10 observations is highlighted in black (if none exist after filtering, the densest available match is used instead).
+
+```{r mip_outcomes_by_match_time, include=FALSE, fig.width=10, fig.height=4.5}
+mip_time_plot_metrics <- c(
+  MIP_pc1_score = "MIP PC1 score",
+  MIP_TD_m = "Total distance (m)",
+  MIP_HSR_m = "HSR distance (m)",
+  MIP_AccelDist_m = "Acceleration distance (m)",
+  MIP_DecelDist_m = "Deceleration distance (m)"
+)
+
+mip_time_base <- all_mip %>%
+  filter(
+    !is.na(match_clock_min),
+    !is.na(half),
+    match_clock_min >= 0
+  ) %>%
+  mutate(half = factor(half, levels = c("1st Half", "2nd Half")))
+
+set.seed(42)
+mip_match_counts <- mip_time_base %>%
+  count(match_date, name = "n") %>%
+  arrange(desc(n), match_date)
+
+mip_highlight_min_n <- 10L
+mip_highlight_games <- mip_match_counts %>%
+  filter(n >= mip_highlight_min_n)
+
+if (nrow(mip_highlight_games) == 0L) {
+  # After cohort/GPS-quality filters, some datasets have no match with n >= 10.
+  # Fall back to randomly choosing among matches that share the highest available n.
+  mip_highlight_min_n <- max(mip_match_counts$n, na.rm = TRUE)
+  mip_highlight_games <- mip_match_counts %>%
+    filter(n == mip_highlight_min_n)
+  message(
+    "No match with >= 10 filtered MIP observations; ",
+    "highlighting among matches with n = ", mip_highlight_min_n, "."
+  )
+}
+
+mip_highlight_match <- as.character(
+  sample(mip_highlight_games$match_date, size = 1)
+)
+mip_highlight_n <- mip_highlight_games$n[
+  mip_highlight_games$match_date == mip_highlight_match
+][1]
+
+mip_time_base <- mip_time_base %>%
+  mutate(is_highlight = match_date == mip_highlight_match)
+
+plot_mip_by_match_time <- function(data, y_var, y_lab) {
+  d <- data %>%
+    filter(!is.na(.data[[y_var]]))
+
+  make_panel <- function(half_lab, xlim, xbreaks, show_y_lab = TRUE) {
+    dd <- dplyr::filter(d, half == half_lab)
+    ggplot(dd, aes(x = match_clock_min, y = .data[[y_var]])) +
+      geom_point(
+        data = function(x) dplyr::filter(x, !is_highlight),
+        colour = "grey45",
+        alpha = 0.45,
+        size = 4
+      ) +
+      geom_point(
+        data = function(x) dplyr::filter(x, is_highlight),
+        colour = "black",
+        alpha = 1,
+        size = 4
+      ) +
+      scale_x_continuous(
+        limits = xlim,
+        breaks = xbreaks,
+        expand = expansion(mult = c(0.01, 0.02))
+      ) +
+      scale_y_continuous(
+        limits = c(0, NA),
+        expand = expansion(mult = c(0, 0.05))
+      ) +
+      labs(
+        x = "Time in Match (min)",
+        y = if (show_y_lab) y_lab else NULL
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+        axis.text.y = if (show_y_lab) element_text() else element_blank(),
+        axis.ticks.y = if (show_y_lab) element_line() else element_blank()
+      ) +
+      ggtitle(half_lab)
+  }
+
+  make_panel("1st Half", c(0, 45), seq(0, 45, by = 5), show_y_lab = TRUE) +
+    make_panel("2nd Half", c(45, 90), seq(45, 90, by = 5), show_y_lab = FALSE) +
+    plot_annotation(
+      subtitle = paste0(
+        "Black points = match ", mip_highlight_match,
+        " (n = ", mip_highlight_n, ")"
+      )
+    )
+}
+
+mip_time_plots <- setNames(
+  lapply(names(mip_time_plot_metrics), function(v) {
+    plot_mip_by_match_time(mip_time_base, v, mip_time_plot_metrics[[v]])
+  }),
+  names(mip_time_plot_metrics)
+)
+
+for (v in names(mip_time_plots)) {
+  ggsave(
+    file.path(stats_dir, paste0("mip_", v, "_by_match_time.png")),
+    mip_time_plots[[v]],
+    width = 10,
+    height = 4.5,
+    dpi = 180,
+    bg = "white"
+  )
+}
+
+cat(
+  "Highlighted match for MIP-by-time plots: ",
+  mip_highlight_match,
+  " (n = ",
+  mip_highlight_n,
+  ")\n",
+  sep = ""
+)
+```
+
+```{r mip_outcomes_by_match_time_show_pc1, fig.width=10, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+cat("\n\n**MIP PC1 score**\n\n")
+print(mip_time_plots[["MIP_pc1_score"]])
+```
+
+```{r mip_outcomes_by_match_time_show_td, fig.width=10, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+cat("\n\n**Total distance (m)**\n\n")
+print(mip_time_plots[["MIP_TD_m"]])
+```
+
+```{r mip_outcomes_by_match_time_show_hsr, fig.width=10, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+cat("\n\n**HSR distance (m)**\n\n")
+print(mip_time_plots[["MIP_HSR_m"]])
+```
+
+```{r mip_outcomes_by_match_time_show_accel, fig.width=10, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+cat("\n\n**Acceleration distance (m)**\n\n")
+print(mip_time_plots[["MIP_AccelDist_m"]])
+```
+
+```{r mip_outcomes_by_match_time_show_decel, fig.width=10, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+cat("\n\n**Deceleration distance (m)**\n\n")
+print(mip_time_plots[["MIP_DecelDist_m"]])
+```
+
+```{r mip_desc_squad, include=FALSE}
+mip_desc_squad <- summarise_mip_metrics(all_mip) %>%
+  mutate(group = "Squad") %>%
+  select(group, metric, n, mean, sd)
+
+write_csv(
+  mip_desc_squad,
+  file.path(stats_dir, "mip_descriptive_squad.csv")
+)
+```
+
+### Squad — MIP descriptive statistics
+
+```{r mip_desc_squad_table, results="asis"}
+kable(
+  mip_desc_squad %>% select(Metric = metric, N = n, Mean = mean, SD = sd),
+  caption = "What does the MIP look like? Mean and SD across cohort MIP observations (starters + subs on before 70:00)."
+)
+```
+
+```{r mip_desc_wide_by_position, include=FALSE}
+mip_by_position <- all_mip %>%
+  filter(!is.na(position), position != "", position != "0") %>%
+  filter_positions_min_n()
+
+position_n <- mip_by_position %>%
+  count(position, name = "n")
+
+mip_desc_wide <- mip_by_position %>%
+  group_by(position) %>%
+  group_modify(~ summarise_mip_metrics(.x)) %>%
+  ungroup() %>%
+  mutate(mean_sd = format_mean_sd(mean, sd)) %>%
+  select(position, metric, mean_sd) %>%
+  pivot_wider(names_from = metric, values_from = mean_sd) %>%
+  left_join(position_n, by = "position") %>%
+  relocate(n, .after = position) %>%
+  arrange(position) %>%
+  mutate(position = as.character(position))
+
+write_csv(
+  mip_desc_wide,
+  file.path(stats_dir, "mip_descriptive_by_position_wide.csv")
+)
+```
+
+### By position — MIP descriptive statistics (mean (SD))
+
+```{r mip_desc_wide_table, results="asis"}
+kable(
+  mip_desc_wide,
+  caption = "Mean (SD) for each 3-minute MIP metric by aggregated position group (positions with n < 2 excluded)."
+)
+```
+
+### Outcome distributions and model family
+
+Distribution of each **physical external-load variable** (total, HSR, accel, decel distance) is assessed with `fitdistrplus` against candidate distributions (normal, gamma, lognormal). The best fit per variable is chosen by AIC, and the **majority distribution sets a single model family** for all MIP mixed models below, so results are comparable across outcomes.
+
+```{r mip_distribution_diagnostics, include=FALSE}
+# Physical external-load variables (continuous, > 0). PC1 is a composite score,
+# so it is excluded from the distribution check that picks the model family.
+physical_metric_vars <- c("MIP_TD_m", "MIP_HSR_m", "MIP_AccelDist_m", "MIP_DecelDist_m")
+physical_metrics <- mip_metrics[physical_metric_vars]
+
+# Candidate distributions, each mapping to an lme4-fittable model:
+#   norm  -> Gaussian LMM (identity link)
+#   gamma -> Gamma GLMM (log link)
+#   lnorm -> Gaussian LMM on log(outcome)  [lognormal]
+mip_candidate_dists <- c(norm = "Normal", gamma = "Gamma", lnorm = "Lognormal")
+
+fit_one_distribution <- function(x, dname) {
+  x <- x[is.finite(x)]
+  # gamma / lognormal require strictly positive data
+  if (dname %in% c("gamma", "lnorm") && any(x <= 0)) {
+    return(tibble(dist = dname, aic = NA_real_, bic = NA_real_))
+  }
+  fit <- tryCatch(fitdistrplus::fitdist(x, dname), error = function(e) NULL)
+  if (is.null(fit)) {
+    tibble(dist = dname, aic = NA_real_, bic = NA_real_)
+  } else {
+    tibble(dist = dname, aic = as.numeric(fit$aic), bic = as.numeric(fit$bic))
+  }
+}
+
+mip_dist_fits <- map_dfr(physical_metric_vars, function(v) {
+  map_dfr(names(mip_candidate_dists), function(d) fit_one_distribution(all_mip[[v]], d)) %>%
+    mutate(variable = v, outcome = physical_metrics[[v]])
+})
+
+# Best-fitting distribution per variable (lowest AIC)
+mip_dist_best <- mip_dist_fits %>%
+  filter(!is.na(aic)) %>%
+  group_by(variable, outcome) %>%
+  slice_min(aic, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(best_dist = mip_candidate_dists[dist])
+
+# Majority vote across variables; tie-break on lowest total AIC
+mip_dist_votes <- mip_dist_best %>% count(dist, name = "n_best")
+mip_dist_total_aic <- mip_dist_fits %>%
+  filter(!is.na(aic)) %>%
+  group_by(dist) %>%
+  summarise(total_aic = sum(aic), .groups = "drop")
+mip_dist_ranking <- mip_dist_votes %>%
+  full_join(mip_dist_total_aic, by = "dist") %>%
+  mutate(n_best = replace_na(n_best, 0L)) %>%
+  arrange(desc(n_best), total_aic)
+
+chosen_dist <- mip_dist_ranking$dist[1]
+mip_model_family <- dplyr::case_when(
+  chosen_dist == "gamma" ~ "gamma",
+  chosen_dist == "lnorm" ~ "lognormal",
+  TRUE ~ "gaussian"
+)
+mip_link_is_log <- mip_model_family %in% c("gamma", "lognormal")
+mip_emm_link <- if (mip_link_is_log) "log" else "identity"
+mip_family_label <- dplyr::case_when(
+  mip_model_family == "gamma" ~ "Gamma GLMM (log link)",
+  mip_model_family == "lognormal" ~ "Gaussian LMM on log(outcome) (lognormal)",
+  TRUE ~ "Gaussian LMM (identity link)"
+)
+
+# Fit one MIP model with the chosen family.
+#   ml = TRUE forces ML estimation for likelihood-ratio tests (lmer);
+#   glmer is ML by default. As a guard, any outcome with non-positive values
+#   under a log family falls back to a Gaussian fit (physical metrics are > 0).
+fit_mip_model <- function(outcome_var, fixed_rhs, data, ml = FALSE) {
+  yv <- lme_var(outcome_var)
+  fam <- mip_model_family
+  if (fam %in% c("gamma", "lognormal") && any(data[[outcome_var]] <= 0, na.rm = TRUE)) {
+    fam <- "gaussian"
+  }
+  if (fam == "gamma") {
+    fml <- as.formula(paste0(yv, " ~ ", fixed_rhs, " + ", lme_random_rhs))
+    glmer(
+      fml, data = data, family = Gamma(link = "log"),
+      control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+    )
+  } else if (fam == "lognormal") {
+    fml <- as.formula(paste0("log(", yv, ") ~ ", fixed_rhs, " + ", lme_random_rhs))
+    lmer(fml, data = data, REML = !ml)
+  } else {
+    fml <- as.formula(paste0(yv, " ~ ", fixed_rhs, " + ", lme_random_rhs))
+    lmer(fml, data = data, REML = !ml)
+  }
+}
+
+# Map a linear-predictor value to the response scale for the chosen family
+mip_response <- function(linpred) if (mip_link_is_log) exp(linpred) else linpred
+
+write_csv(mip_dist_fits, file.path(stats_dir, "mip_distribution_fits.csv"))
+write_csv(mip_dist_best, file.path(stats_dir, "mip_distribution_best_per_variable.csv"))
+```
+
+```{r mip_distribution_table, results="asis"}
+mip_dist_best %>%
+  transmute(
+    Variable = outcome,
+    `Best distribution` = best_dist,
+    AIC = round(aic, 1)
+  ) %>%
+  kable(
+    caption = paste0(
+      "Best-fitting distribution per physical load variable (fitdistrplus, lowest AIC). ",
+      "Majority-selected family applied to all MIP mixed models: ", mip_family_label, "."
+    )
+  )
+```
+
+### Ball in play and external load (mixed model)
+
+Is a high 3-minute MIP driven by true intensity, or partly by more ball-in-play time (fewer stoppages) within that window?  
+Mixed model per outcome: **MIP ~ ball-in-play time + (1 | player) + (1 | match)** (crossed random intercepts), fitted with the **majority-selected family** from the distribution check above.
+
+```{r mip_bip_lme, include=FALSE}
+mip_lme_data <- all_mip %>%
+  filter(!is.na(bip_time), bip_time > 0, complete.cases(pick(all_of(names(mip_metrics))))) %>%
+  mutate(bip_time_z = as.numeric(scale(bip_time)))
+
+mip_bip_models <- setNames(
+  lapply(names(mip_metrics), function(v) fit_mip_model(v, "bip_time_z", mip_lme_data)),
+  names(mip_metrics)
+)
+
+mip_bip_lme_coef <- map_dfr(names(mip_metrics), function(v) {
+  tidy_lmer_fixed(mip_bip_models[[v]]) %>%
+    filter(term == "bip_time_z") %>%
+    mutate(
+      outcome_var = v,
+      outcome = mip_metrics[[v]]
+    )
+}) %>%
+  select(outcome, outcome_var, estimate, std.error, statistic, p.value, conf.low, conf.high)
+
+mip_bip_lme_fit <- map_dfr(names(mip_metrics), function(v) {
+  m <- mip_bip_models[[v]]
+  g <- ngrps(m)
+  tibble(
+    outcome = mip_metrics[[v]],
+    outcome_var = v,
+    n_obs = nobs(m),
+    n_players = as.integer(g[["player_name"]]),
+    n_matches = as.integer(g[["match_date"]]),
+    AIC = AIC(m)
+  )
+})
+
+write_csv(mip_bip_lme_coef, file.path(stats_dir, "mip_bip_lme_coefficients.csv"))
+write_csv(mip_bip_lme_fit, file.path(stats_dir, "mip_bip_lme_fit_stats.csv"))
+```
+
+```{r mip_bip_lme_coef_table, results="asis"}
+mip_bip_lme_coef %>%
+  mutate(
+    estimate = round(estimate, 3),
+    conf.low = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    `p-value` = format_p_value(p.value)
+  ) %>%
+  select(
+    Outcome = outcome,
+    `beta (per 1 SD bip_time)` = estimate,
+    `95% CI low` = conf.low,
+    `95% CI high` = conf.high,
+    `p-value`
+  ) %>%
+  kable(
+    caption = paste0(
+      "Fixed effect of ball-in-play time (standardized) on each 3-minute MIP outcome. ",
+      "Model: ", mip_family_label, "; random intercepts: player + match. ",
+      if (mip_link_is_log) {
+        "Estimates are on the log scale (multiplicative effect per 1 SD ball-in-play time)."
+      } else {
+        "Positive beta suggests higher external load when more of the window is ball in play."
+      }
+    )
+  )
+```
+
+```{r mip_bip_lme_plots, include=FALSE, fig.width=11, fig.height=9}
+# 1) Forest plot — standardized bip_time effect across outcomes
+p_forest <- mip_bip_lme_coef %>%
+  mutate(
+    outcome = fct_reorder(outcome, estimate),
+    sig = if_else(p.value < 0.05, "p < 0.05", "n.s.")
+  ) %>%
+  ggplot(aes(x = estimate, y = outcome, colour = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), linewidth = 0.7) +
+  scale_colour_manual(values = c("p < 0.05" = "#C0392B", "n.s." = "grey40")) +
+  labs(
+    title = "Ball in play vs 3-minute MIP external load (mixed model)",
+    subtitle = paste0("Fixed effect per 1 SD bip_time | ", mip_family_label, " | random intercepts: player + match"),
+    x = "Estimate (beta per 1 SD bip_time)",
+    y = NULL,
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# 2) Observed points + population-level predicted lines (fixed effects only; RE = 0)
+# Predictions formed on the link scale, then back-transformed to the response.
+pred_lines <- map_dfr(names(mip_metrics), function(v) {
+  fe <- fixef(mip_bip_models[[v]])
+  xx <- seq(min(mip_lme_data$bip_time_z), max(mip_lme_data$bip_time_z), length.out = 100)
+  linpred <- unname(fe["(Intercept)"]) + unname(fe["bip_time_z"]) * xx
+  tibble(
+    x = xx,
+    outcome_var = v,
+    outcome = mip_metrics[[v]],
+    predicted = mip_response(linpred)
+  )
+})
+
+obs_long <- mip_lme_data %>%
+  pivot_longer(all_of(names(mip_metrics)), names_to = "outcome_var", values_to = "value") %>%
+  mutate(outcome = mip_metrics[outcome_var])
+
+# Back-transform x for display (predictions on z-scale → bip_time scale)
+bip_mu <- mean(mip_lme_data$bip_time)
+bip_sd <- sd(mip_lme_data$bip_time)
+
+pred_lines <- pred_lines %>%
+  mutate(bip_time = x * bip_sd + bip_mu)
+
+p_scatter <- ggplot(obs_long, aes(x = bip_time, y = value)) +
+  geom_point(alpha = 0.35, size = 1.6, colour = "grey35") +
+  geom_line(
+    data = pred_lines,
+    aes(x = bip_time, y = predicted),
+    colour = "#2980B9",
+    linewidth = 1.1
+  ) +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 2) +
+  scale_x_continuous(limits = c(NA, 180)) +
+  labs(
+    title = "3-minute MIP outcomes vs ball-in-play time",
+    subtitle = "Each point = one 3-min MIP; blue line = population trend (response scale, random effects = 0)",
+    x = "Ball in play (s)",
+    y = "3-minute MIP value"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(strip.text = element_text(face = "bold"))
+
+mip_bip_lme_fig <- p_forest / p_scatter + plot_layout(heights = c(1, 2.2))
+
+ggsave(
+  file.path(stats_dir, "mip_bip_lme_figure.png"),
+  mip_bip_lme_fig,
+  width = 11,
+  height = 12,
+  dpi = 180,
+  bg = "white"
+)
+```
+
+```{r mip_bip_lme_fig_show, fig.width=11, fig.height=12, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(mip_bip_lme_fig)
+```
+
+### Playing position and external load (mixed model)
+
+How much is 3-minute MIP external output explained by **aggregated playing position** (after accounting for repeated measures per player)?  
+Linear mixed model per outcome: **MIP ~ position + (1 | player) + (1 | match)**, reference level = **CB** (crossed random intercepts for player and match). Positions with fewer than two observations are excluded.
+
+```{r mip_position_lme, include=FALSE}
+mip_pos_lme_data <- all_mip %>%
+  filter(
+    !is.na(position), position != "", position != "0",
+    complete.cases(pick(all_of(names(mip_metrics))))
+  ) %>%
+  filter_positions_min_n()
+
+mip_pos_models <- setNames(
+  lapply(names(mip_metrics), function(v) fit_mip_model(v, "position", mip_pos_lme_data)),
+  names(mip_metrics)
+)
+
+# Omnibus test: does position improve fit vs intercept-only model?
+# Both models ML-fitted (ml = TRUE) so anova() can compare them.
+mip_pos_lme_omnibus <- map_dfr(names(mip_metrics), function(v) {
+  m0 <- fit_mip_model(v, "1", mip_pos_lme_data, ml = TRUE)
+  m1 <- fit_mip_model(v, "position", mip_pos_lme_data, ml = TRUE)
+  cmp <- anova(m0, m1)
+  tibble(
+    outcome = mip_metrics[[v]],
+    outcome_var = v,
+    p.value = cmp$`Pr(>Chisq)`[2]
+  )
+})
+
+# Position contrasts vs reference (CB)
+mip_pos_lme_coef <- map_dfr(names(mip_metrics), function(v) {
+  tidy_lmer_fixed(mip_pos_models[[v]]) %>%
+    filter(str_detect(term, "^position")) %>%
+    mutate(
+      position = str_remove(term, "^position"),
+      outcome_var = v,
+      outcome = mip_metrics[[v]]
+    )
+}) %>%
+  select(outcome, outcome_var, position, estimate, std.error, statistic, p.value, conf.low, conf.high)
+
+mip_pos_emmeans <- map_dfr(names(mip_metrics), function(v) {
+  lmer_pos_emmeans(mip_pos_models[[v]], levels(mip_pos_lme_data$position), link = mip_emm_link) %>%
+    mutate(
+      outcome_var = v,
+      outcome = mip_metrics[[v]]
+    )
+})
+
+mip_pos_lme_fit <- map_dfr(names(mip_metrics), function(v) {
+  m <- mip_pos_models[[v]]
+  g <- ngrps(m)
+  tibble(
+    outcome = mip_metrics[[v]],
+    outcome_var = v,
+    n_obs = nobs(m),
+    n_players = as.integer(g[["player_name"]]),
+    n_matches = as.integer(g[["match_date"]]),
+    AIC = AIC(m)
+  )
+})
+
+write_csv(mip_pos_lme_omnibus, file.path(stats_dir, "mip_position_lme_omnibus.csv"))
+write_csv(mip_pos_lme_coef, file.path(stats_dir, "mip_position_lme_coefficients_vs_cb.csv"))
+write_csv(mip_pos_emmeans, file.path(stats_dir, "mip_position_lme_emmeans.csv"))
+write_csv(mip_pos_lme_fit, file.path(stats_dir, "mip_position_lme_fit_stats.csv"))
+```
+
+```{r mip_position_lme_omnibus_table, results="asis"}
+mip_pos_lme_omnibus %>%
+  mutate(`p-value (position)` = format_p_value(p.value)) %>%
+  select(Outcome = outcome, `p-value (position)`) %>%
+  kable(
+    caption = paste0(
+      "Likelihood-ratio test for position (aggregated groups) on each 3-minute MIP outcome. ",
+      "Model: ", mip_family_label, ". Compares position vs intercept-only (both with player + match random intercepts). Reference position: CB."
+    )
+  )
+```
+
+```{r mip_position_lme_plots, include=FALSE, fig.width=11, fig.height=10}
+# 1) Omnibus position effect across outcomes
+p_pos_omnibus <- mip_pos_lme_omnibus %>%
+  mutate(
+    outcome = fct_reorder(outcome, -log10(p.value)),
+    sig = if_else(p.value < 0.05, "p < 0.05", "n.s.")
+  ) %>%
+  ggplot(aes(x = -log10(p.value), y = outcome, colour = sig)) +
+  geom_vline(xintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c("p < 0.05" = "#C0392B", "n.s." = "grey40")) +
+  labs(
+    title = "Playing position vs 3-minute MIP external load (mixed model)",
+    subtitle = paste0("Omnibus LRT for position (ref: CB) | ", mip_family_label, " | random intercepts: player + match"),
+    x = expression(-log[10](p)),
+    y = NULL,
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# 2) Raw points + LMM marginal means by position
+obs_pos_long <- mip_pos_lme_data %>%
+  pivot_longer(all_of(names(mip_metrics)), names_to = "outcome_var", values_to = "value") %>%
+  mutate(outcome = mip_metrics[outcome_var])
+
+emm_pos_long <- mip_pos_emmeans %>%
+  mutate(
+    outcome = mip_metrics[outcome_var],
+    position = factor(position, levels = levels(mip_pos_lme_data$position))
+  )
+
+p_pos_means <- ggplot(obs_pos_long, aes(x = position, y = value)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.35, size = 1.6, colour = "grey35") +
+  geom_pointrange(
+    data = emm_pos_long,
+    aes(x = position, y = estimate, ymin = conf.low, ymax = conf.high),
+    colour = "#2980B9",
+    linewidth = 0.7,
+    fatten = 2.5,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ outcome, scales = "free_y", ncol = 2) +
+  labs(
+    title = "3-minute MIP outcomes by aggregated position",
+    subtitle = "Points = observations; blue = model marginal mean \u00b1 95% CI (response scale, random effects = 0)",
+    x = "Position",
+    y = "3-minute MIP value"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+mip_pos_lme_fig <- p_pos_omnibus / p_pos_means + plot_layout(heights = c(1, 2.4))
+
+ggsave(
+  file.path(stats_dir, "mip_position_lme_figure.png"),
+  mip_pos_lme_fig,
+  width = 11,
+  height = 12,
+  dpi = 180,
+  bg = "white"
+)
+```
+
+```{r mip_position_lme_fig_show, fig.width=11, fig.height=12, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(mip_pos_lme_fig)
+```
+
+### Tactical action count distributions by position
+
+Each panel shows how many 3-minute MIP windows recorded each action count, faceted by aggregated playing position. The **y-axis** is shared across all individual actions (0 to the maximum observed count). **Colour** is scaled relative to the highest cell count within each position panel (cell labels show raw counts).
+
+```{r tactic_count_heatmap, include=FALSE}
+p_tactic_count_heatmap <- build_tactic_count_heatmap(
+  data = all_tactical,
+  metric_cols = names(tactical_individual_metrics),
+  metric_labels = tactical_individual_metrics,
+  title = "Individual tactical action counts in 3-minute MIP windows",
+  subtitle = "Colour = relative to position max; labels = raw MIP window counts",
+  save_path = file.path(stats_dir, "tactic_action_count_heatmap.png")
+)
+```
+
+```{r tactic_count_heatmap_show, fig.width=10, fig.height=12, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(p_tactic_count_heatmap)
+```
+
+### Phase and transition count distributions by position
+
+Same layout for **group-level** tactical counts: long ball, attacking transition, counter press, and defensive transition. The y-axis is shared across these four metrics (0 to their maximum observed count); colour is again relative within each position panel.
+
+```{r tactic_phase_count_heatmap, include=FALSE}
+p_tactic_phase_count_heatmap <- build_tactic_count_heatmap(
+  data = all_tactical,
+  metric_cols = names(tactical_phase_metrics),
+  metric_labels = tactical_phase_metrics,
+  title = "Phase and transition counts in 3-minute MIP windows",
+  subtitle = "Colour = relative to position max; labels = raw MIP window counts",
+  save_path = file.path(stats_dir, "tactic_phase_count_heatmap.png")
+)
+```
+
+```{r tactic_phase_count_heatmap_show, fig.width=10, fig.height=12, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(p_tactic_phase_count_heatmap)
+```
+
+### Playing position and tactical outputs — individual actions (mixed model)
+
+**MIP ~ position + (1 | player) + (1 | match)**, reference = **CB**. Positions with fewer than two observations are excluded.  
+Mean counts by position are shown as **pitch heatmaps** (one panel per action, each action its own colour; circular marker shade = low → high mean count); LMM tables test whether position matters overall.
+
+```{r tactic_individual_position_lme, include=FALSE}
+tactic_individual_pos <- run_position_lme_analysis(
+  all_tactical,
+  tactical_individual_metrics,
+  title_tag = "individual actions",
+  file_prefix = "tactic_individual",
+  plot_style = "heatmap"
+)
+```
+
+```{r tactic_individual_pos_omnibus_table, results="asis"}
+tactic_individual_pos$omnibus %>%
+  mutate(`p-value (position)` = format_p_value(p.value)) %>%
+  select(Outcome = outcome, `p-value (position)`) %>%
+  kable(
+    caption = "Likelihood-ratio test for position on individual tactical actions in the 3-minute MIP. Reference: CB."
+  )
+```
+
+```{r tactic_individual_pos_fig_show, fig.width=22, fig.height=36, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(tactic_individual_pos$fig)
+```
+
+### Phase / transition counts by position
+
+Mean (SD) counts per 3-minute MIP of **long ball**, **attacking transition**, **counter press**, and **defensive transition**, by aggregated playing position, plus a **team** average across all included MIP observations. Positions with fewer than two observations are excluded (same filter as elsewhere).
+
+Paired tests then ask, for each position and for the team, whether **attacking transition** counts were significantly higher than **defensive transition** counts within the same MIP windows.
+
+```{r tactic_phase_means, include=FALSE}
+phase_cols <- names(tactical_phase_metrics)
+
+phase_data <- all_tactical %>%
+  filter(
+    !is.na(position), position != "", position != "0",
+    complete.cases(pick(all_of(phase_cols)))
+  ) %>%
+  filter_positions_min_n()
+
+phase_by_pos <- phase_data %>%
+  group_by(position) %>%
+  summarise(
+    n = n(),
+    across(
+      all_of(phase_cols),
+      list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        sd   = ~ sd(.x, na.rm = TRUE)
+      ),
+      .names = "{.col}__{.fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(match(as.character(position), position_order))
+
+phase_team <- phase_data %>%
+  summarise(
+    position = "Team",
+    n = n(),
+    across(
+      all_of(phase_cols),
+      list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        sd   = ~ sd(.x, na.rm = TRUE)
+      ),
+      .names = "{.col}__{.fn}"
+    )
+  )
+
+phase_table_raw <- bind_rows(phase_by_pos, phase_team)
+
+phase_table_wide <- phase_table_raw %>%
+  transmute(
+    Position = position,
+    N = n,
+    `Long Ball` = format_mean_sd(`Long Ball__mean`, `Long Ball__sd`),
+    `Attacking Transition` = format_mean_sd(
+      `Attacking Transition__mean`, `Attacking Transition__sd`
+    ),
+    `Counter Press` = format_mean_sd(`Counter Press__mean`, `Counter Press__sd`),
+    `Defensive Transition` = format_mean_sd(
+      `Defensive Transition__mean`, `Defensive Transition__sd`
+    )
+  )
+
+write_csv(
+  phase_table_raw,
+  file.path(stats_dir, "tactic_phase_means_by_position.csv")
+)
+
+# Attacking vs defensive transition: paired Wilcoxon within MIP, by position + team
+phase_at_dt_groups <- c(as.character(levels(phase_data$position)), "Team")
+
+phase_at_vs_dt <- map_dfr(phase_at_dt_groups, function(pos) {
+  d <- if (identical(pos, "Team")) {
+    phase_data
+  } else {
+    phase_data %>% filter(as.character(position) == pos)
+  }
+  at <- d[["Attacking Transition"]]
+  dt <- d[["Defensive Transition"]]
+  wt <- tryCatch(
+    wilcox.test(at, dt, paired = TRUE, exact = FALSE, correct = TRUE,
+                alternative = "greater"),
+    error = function(e) list(p.value = NA_real_)
+  )
+  tibble(
+    position = pos,
+    n = length(at),
+    mean_attacking = mean(at, na.rm = TRUE),
+    mean_defensive = mean(dt, na.rm = TRUE),
+    mean_diff = mean(at - dt, na.rm = TRUE),
+    p.value = wt$p.value
+  )
+}) %>%
+  mutate(
+    p.adj = p.adjust(p.value, method = "holm"),
+    direction = case_when(
+      is.na(p.adj) ~ "No difference",
+      p.adj < 0.05 ~ "Attacking transition more common",
+      TRUE ~ "Not significantly more attacking"
+    )
+  )
+
+write_csv(
+  phase_at_vs_dt,
+  file.path(stats_dir, "tactic_attacking_vs_defensive_transition.csv")
+)
+```
+
+```{r tactic_phase_means_table, results="asis"}
+kable(
+  phase_table_wide,
+  caption = paste0(
+    "Mean (SD) counts per 3-minute MIP of long ball, attacking transition, ",
+    "counter press, and defensive transition by aggregated position, ",
+    "plus team average across all included MIP observations."
+  )
+)
+```
+
+```{r tactic_at_vs_dt_table, results="asis"}
+phase_at_vs_dt %>%
+  transmute(
+    Position = position,
+    N = n,
+    `Mean attacking transition` = sprintf("%.2f", mean_attacking),
+    `Mean defensive transition` = sprintf("%.2f", mean_defensive),
+    `Mean diff (AT - DT)` = sprintf("%.2f", mean_diff),
+    `Holm-adjusted p` = format_p_value(p.adj),
+    Interpretation = direction
+  ) %>%
+  kable(
+    caption = paste0(
+      "Paired Wilcoxon signed-rank tests (one-sided: attacking transition > defensive transition) ",
+      "on observation-level counts within each 3-minute MIP, by aggregated position and for the team. ",
+      "Holm adjustment applied across all rows. ",
+      "Positive mean differences indicate more attacking than defensive transitions in the MIP."
+    )
+  )
+```
+
+### Position versus all other positions — tactical action counts
+
+For each tactical action, each position is compared with **all other positions** using the observation-level counts (including zeros). The table reports the position mean, the mean of the remaining positions, and a Wilcoxon rank-sum test of that position's counts versus the others. P-values are Holm-adjusted within each action across positions. The pitch heatmaps above remain raw mean counts and are unchanged.
+
+```{r tactic_position_vs_others, include=FALSE}
+tac_vs_data <- all_tactical %>%
+  filter(
+    !is.na(position), position != "", position != "0",
+    complete.cases(pick(all_of(names(tactical_individual_metrics))))
+  ) %>%
+  filter_positions_min_n() %>%
+  mutate(position = droplevels(factor(position, levels = position_order)))
+
+tac_pos_levels <- levels(tac_vs_data$position)
+
+tac_vs_table_raw <- map_dfr(names(tactical_individual_metrics), function(v) {
+  map_dfr(tac_pos_levels, function(pos) {
+    x <- tac_vs_data %>% filter(position == pos) %>% pull(.data[[v]])
+    y <- tac_vs_data %>% filter(position != pos) %>% pull(.data[[v]])
+    wt <- tryCatch(
+      wilcox.test(x, y, exact = FALSE, correct = TRUE),
+      error = function(e) list(p.value = NA_real_)
+    )
+    tibble(
+      outcome_var = v,
+      outcome = tactical_individual_metrics[[v]],
+      position = pos,
+      n = length(x),
+      mean_count = mean(x, na.rm = TRUE),
+      mean_others = mean(y, na.rm = TRUE),
+      mean_diff = mean(x, na.rm = TRUE) - mean(y, na.rm = TRUE),
+      p.value = wt$p.value
+    )
+  })
+}) %>%
+  group_by(outcome) %>%
+  mutate(
+    p.adj = p.adjust(p.value, method = "holm"),
+    direction = case_when(
+      is.na(p.adj) ~ "No difference",
+      p.adj < 0.05 & mean_diff > 0 ~ "Significantly higher",
+      p.adj < 0.05 & mean_diff < 0 ~ "Significantly lower",
+      TRUE ~ "No difference"
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(outcome, match(position, tac_pos_levels))
+```
+
+```{r tactic_position_vs_others_table, results="asis"}
+tac_vs_table_raw %>%
+  transmute(
+    `Tactical action` = outcome,
+    Position = position,
+    N = n,
+    `Mean count` = sprintf("%.2f", mean_count),
+    `Mean of others` = sprintf("%.2f", mean_others),
+    `Mean diff` = sprintf("%.2f", mean_diff),
+    `Holm-adjusted p` = format_p_value(p.adj),
+    Direction = direction
+  ) %>%
+  kable(
+    caption = paste0(
+      "Position versus all other positions for tactical-action counts in the 3-minute MIP. ",
+      "Means are arithmetic averages of observation-level counts (including zeros). ",
+      "P-values are from Wilcoxon rank-sum tests (position vs pooled remaining positions), ",
+      "Holm-adjusted within each action across positions."
+    )
+  )
+```
+
+### Context by pitch third — in vs out of possession
+
+Two pitches — **in possession (IP)** and **out of possession (OOP)** — each shaded by pitch third. Values are the mean share of **phase-of-play time** spent in each third during the 3-minute MIP: for each window the six phase durations are converted to a proportion of that window's total phase-of-play time, then averaged across the cohort. Thirds are mapped **1 = own/defensive third → 3 = attacking third** (flip `context_third` below if your coding uses the opposite convention).
+
+MIP IP and OOP shares are also compared with match-average references (**IP = 44.0%**, **OOP = 56.0%**) using one-sample tests — for the **whole cohort** and again **within each aggregated playing position**. Per-third MIP shares are shown descriptively only, because full-match third exposure is not available.
+
+```{r context_pitch_thirds, include=FALSE}
+context_third <- tibble::tribble(
+  ~var,   ~phase, ~name,   ~third,
+  "IP1",  "IP",   "IP1",   1,
+  "IP2",  "IP",   "IP2",   2,
+  "IP3",  "IP",   "IP3",   3,
+  "OOP1", "OOP",  "OOP1",  1,
+  "OOP2", "OOP",  "OOP2",  2,
+  "OOP3", "OOP",  "OOP3",  3
+)
+
+context_means <- all_tactical %>%
+  filter(phase_of_play > 0) %>%
+  mutate(across(all_of(context_third$var), ~ .x / phase_of_play)) %>%
+  summarise(across(all_of(context_third$var), ~ mean(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "value") %>%
+  left_join(context_third, by = "var")
+
+# Match-average IP / OOP references (full-match exposure across the season)
+context_match_ip_ref <- 0.440
+context_match_oop_ref <- 0.560
+
+# Per-MIP IP and OOP shares of phase-of-play time, tested vs match averages
+context_phase_shares <- all_tactical %>%
+  filter(phase_of_play > 0) %>%
+  transmute(
+    IP = (IP1 + IP2 + IP3) / phase_of_play,
+    OOP = (OOP1 + OOP2 + OOP3) / phase_of_play
+  )
+
+context_stats <- tibble::tribble(
+  ~phase, ~ref_share, ~ref_label,
+  "IP",   context_match_ip_ref,  "Match average IP (44.0%)",
+  "OOP",  context_match_oop_ref, "Match average OOP (56.0%)"
+) %>%
+  mutate(
+    stats = map2(phase, ref_share, function(ph, mu) {
+      x <- context_phase_shares[[ph]]
+      tt <- t.test(x, mu = mu)
+      tibble(
+        n = sum(!is.na(x)),
+        mean_share = mean(x, na.rm = TRUE),
+        sd_share = sd(x, na.rm = TRUE),
+        mean_diff = mean(x, na.rm = TRUE) - mu,
+        conf.low = unname(tt$conf.int[1]),
+        conf.high = unname(tt$conf.int[2]),
+        p.value = tt$p.value
+      )
+    })
+  ) %>%
+  tidyr::unnest(stats) %>%
+  mutate(
+    p.adj = p.adjust(p.value, method = "holm"),
+    direction = case_when(
+      p.adj < 0.05 & mean_diff > 0 ~ "Higher than match average",
+      p.adj < 0.05 & mean_diff < 0 ~ "Lower than match average",
+      TRUE ~ "Not different from match average"
+    )
+  )
+
+# Same one-sample tests within each aggregated playing position
+context_phase_shares_pos <- all_tactical %>%
+  filter(phase_of_play > 0, !is.na(position), position != "", position != "0") %>%
+  filter_positions_min_n() %>%
+  transmute(
+    position,
+    IP = (IP1 + IP2 + IP3) / phase_of_play,
+    OOP = (OOP1 + OOP2 + OOP3) / phase_of_play
+  )
+
+context_pos_levels_test <- levels(context_phase_shares_pos$position)
+
+context_stats_pos <- map_dfr(context_pos_levels_test, function(pos) {
+  map_dfr(c("IP", "OOP"), function(ph) {
+    mu <- if (identical(ph, "IP")) context_match_ip_ref else context_match_oop_ref
+    x <- context_phase_shares_pos %>%
+      filter(as.character(position) == pos) %>%
+      .[[ph]]
+    tt <- tryCatch(
+      t.test(x, mu = mu),
+      error = function(e) list(
+        conf.int = c(NA_real_, NA_real_),
+        p.value = NA_real_
+      )
+    )
+    tibble(
+      position = factor(pos, levels = context_pos_levels_test),
+      phase = ph,
+      ref_share = mu,
+      ref_label = if (identical(ph, "IP")) {
+        "Match average IP (44.0%)"
+      } else {
+        "Match average OOP (56.0%)"
+      },
+      n = sum(!is.na(x)),
+      mean_share = mean(x, na.rm = TRUE),
+      sd_share = sd(x, na.rm = TRUE),
+      mean_diff = mean(x, na.rm = TRUE) - mu,
+      conf.low = unname(tt$conf.int[1]),
+      conf.high = unname(tt$conf.int[2]),
+      p.value = tt$p.value
+    )
+  })
+}) %>%
+  mutate(
+    p.adj = p.adjust(p.value, method = "holm"),
+    direction = case_when(
+      is.na(p.adj) ~ "Not different from match average",
+      p.adj < 0.05 & mean_diff > 0 ~ "Higher than match average",
+      p.adj < 0.05 & mean_diff < 0 ~ "Lower than match average",
+      TRUE ~ "Not different from match average"
+    )
+  ) %>%
+  arrange(position, match(phase, c("IP", "OOP")))
+
+write_csv(
+  context_stats_pos %>%
+    select(position, phase, ref_share, n, mean_share, sd_share, mean_diff,
+           conf.low, conf.high, p.value, p.adj, direction),
+  file.path(stats_dir, "context_ip_oop_vs_match_by_position.csv")
+)
+
+write_csv(
+  context_means %>% select(phase, name, third, value),
+  file.path(stats_dir, "context_pitch_third_means.csv")
+)
+
+context_fill_max <- max(context_means$value, na.rm = TRUE)
+
+p_ctx_ip <- plot_pitch_context_full(
+  context_means %>% filter(phase == "IP") %>% select(third, name, value),
+  title = "In possession",
+  fill_max = context_fill_max
+)
+p_ctx_oop <- plot_pitch_context_full(
+  context_means %>% filter(phase == "OOP") %>% select(third, name, value),
+  title = "Out of possession",
+  fill_max = context_fill_max
+)
+
+context_fig <- (p_ctx_ip | p_ctx_oop) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Context by pitch third (mean share of 3-minute MIP phase-of-play time)",
+    theme = theme(plot.title = element_text(face = "bold", size = 12))
+  ) &
+  theme(legend.position = "bottom")
+
+ggsave(
+  file.path(stats_dir, "context_pitch_thirds_figure.png"),
+  context_fig,
+  width = 11, height = 8, dpi = 300, bg = "white"
+)
+
+# Same visual, one small pitch per playing position (shared colour scale)
+context_means_pos <- all_tactical %>%
+  filter(phase_of_play > 0, !is.na(position), position != "", position != "0") %>%
+  filter_positions_min_n() %>%
+  mutate(across(all_of(context_third$var), ~ .x / phase_of_play)) %>%
+  group_by(position) %>%
+  summarise(across(all_of(context_third$var), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(-position, names_to = "var", values_to = "value") %>%
+  left_join(context_third, by = "var")
+
+write_csv(
+  context_means_pos %>% select(position, phase, name, third, value),
+  file.path(stats_dir, "context_pitch_third_means_by_position.csv")
+)
+
+context_pos_levels <- levels(context_means_pos$position)
+context_pos_fmax <- max(context_means_pos$value, na.rm = TRUE)
+
+context_pos_plots <- map(context_pos_levels, function(p) {
+  plot_pitch_context_split(
+    context_means_pos %>%
+      filter(position == p) %>%
+      transmute(side = phase, third, name, value),
+    title = p,
+    fill_max = context_pos_fmax,
+    label_size = 2.8,
+    head_size = 2.6,
+    title_size = 11
+  )
+})
+
+context_pos_fig <- wrap_plots(context_pos_plots, ncol = 3) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Context by pitch third, by position (mean share of 3-minute MIP phase-of-play time)",
+    theme = theme(plot.title = element_text(face = "bold", size = 13))
+  ) &
+  theme(legend.position = "bottom")
+
+ggsave(
+  file.path(stats_dir, "context_pitch_thirds_by_position_figure.png"),
+  context_pos_fig,
+  width = 12, height = 15, dpi = 200, bg = "white"
+)
+```
+
+```{r context_pitch_thirds_show, fig.width=11, fig.height=8, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(context_fig)
+```
+
+```{r context_pitch_thirds_stats_table, results="asis"}
+context_stats %>%
+  transmute(
+    Phase = phase,
+    N = n,
+    `MIP mean share` = sprintf("%.3f", mean_share),
+    `Match reference` = sprintf("%.3f", ref_share),
+    `Mean diff` = sprintf("%.3f", mean_diff),
+    `95% CI` = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+    `Holm-adjusted p` = format_p_value(p.adj),
+    Interpretation = direction
+  ) %>%
+  kable(
+    caption = paste0(
+      "One-sample tests of MIP in-possession (IP) and out-of-possession (OOP) shares against match-average ",
+      "references (IP = 44.0%, OOP = 56.0%). Holm adjustment applied across the two tests. ",
+      "Positive mean differences indicate that MIPs spent a larger share of phase-of-play time in that state ",
+      "than the match average."
+    )
+  )
+```
+
+Same visual broken down by **playing position** (shared colour scale so positions are directly comparable). Each position's MIP IP / OOP shares are also tested against the same **season team match averages** (IP = 44.0%, OOP = 56.0%).
+
+```{r context_pitch_thirds_by_position_show, fig.width=12, fig.height=15, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(context_pos_fig)
+```
+
+```{r context_pitch_thirds_stats_by_position_table, results="asis"}
+context_stats_pos %>%
+  transmute(
+    Position = position,
+    Phase = phase,
+    N = n,
+    `MIP mean share` = sprintf("%.3f", mean_share),
+    `Match reference` = sprintf("%.3f", ref_share),
+    `Mean diff` = sprintf("%.3f", mean_diff),
+    `95% CI` = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+    `Holm-adjusted p` = format_p_value(p.adj),
+    Interpretation = direction
+  ) %>%
+  kable(
+    caption = paste0(
+      "One-sample tests of MIP in-possession (IP) and out-of-possession (OOP) shares ",
+      "within each aggregated playing position against season team match-average references ",
+      "(IP = 44.0%, OOP = 56.0%). Holm adjustment applied across all position \u00d7 phase tests. ",
+      "Positive mean differences indicate that that position's MIPs spent a larger share of ",
+      "phase-of-play time in that state than the team match average."
+    )
+  )
+```
+
+### Substitution time and MIP outcomes — playing-time threshold
+
+Relationship between when a player is introduced (`sub_time`) and 3-minute MIP outcomes (`MIP_pc1_score` and distance metrics), to look for a meaningful playing-time threshold. Uses the same cohort as the rest of this report (starters excluded from these plots; only **substitutes** with `sub_time` &gt; 0). Candidate threshold marked at **45 minutes**.
+
+```{r sub_time_threshold, include=FALSE}
+mip_distance_vars <- c(
+  MIP_TD_m = "Total distance (m)",
+  MIP_HSR_m = "HSR distance (m)",
+  MIP_AccelDist_m = "Accel distance (m)",
+  MIP_DecelDist_m = "Decel distance (m)"
+)
+
+sub_threshold_data <- all_mip %>%
+  filter(sub != 0L) %>%
+  transmute(
+    sub_time = parse_mmss_to_min(sub_time),
+    MIP_pc1_score = as.numeric(MIP_pc1_score),
+    across(all_of(names(mip_distance_vars)), as.numeric)
+  ) %>%
+  filter(!is.na(sub_time), sub_time > 0)
+
+threshold_line <- 45
+
+plot_sub_time_loess <- function(data, y_var, y_label, title) {
+  ggplot(data, aes(x = sub_time, y = .data[[y_var]])) +
+    geom_point(alpha = 0.5, size = 2, colour = "grey35") +
+    geom_smooth(method = "loess", se = TRUE, colour = "#2980B9", fill = "#2980B9", alpha = 0.15) +
+    geom_vline(xintercept = threshold_line, linetype = "dashed", colour = "#C0392B", linewidth = 0.7) +
+    labs(
+      title = title,
+      subtitle = "LOESS trend; dashed line = 45-min candidate threshold",
+      x = "Substitution time (minutes subbed on)",
+      y = y_label
+    ) +
+    theme_minimal(base_size = 11)
+}
+
+# 1) Scatter + loess — PC1 score
+p_sub_scatter <- sub_threshold_data %>%
+  filter(!is.na(MIP_pc1_score)) %>%
+  plot_sub_time_loess(
+    "MIP_pc1_score",
+    "MIP PC1 score",
+    "Substitution time vs MIP PC1 score"
+  )
+
+# LOESS trends — MIP distance metrics
+distance_loess_plots <- map(names(mip_distance_vars), function(var) {
+  sub_threshold_data %>%
+    filter(!is.na(.data[[var]])) %>%
+    plot_sub_time_loess(var, mip_distance_vars[[var]], paste("Substitution time vs", mip_distance_vars[[var]]))
+})
+
+# 2) Histogram of sub_time
+p_sub_hist <- ggplot(sub_threshold_data, aes(x = sub_time)) +
+  geom_histogram(binwidth = 10, boundary = 0, fill = "#2980B9", colour = "white") +
+  labs(
+    title = "Distribution of substitution times",
+    subtitle = "10-minute bins — look for natural breaks",
+    x = "Substitution time (minutes subbed on)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 11)
+
+# 3) Rolling variance of MIP_pc1_score in 5-min sub_time bins
+sub_var_binned <- sub_threshold_data %>%
+  filter(!is.na(MIP_pc1_score)) %>%
+  mutate(bin = floor(sub_time / 5) * 5) %>%
+  group_by(bin) %>%
+  summarise(
+    bin_center = first(bin) + 2.5,
+    var_mip = var(MIP_pc1_score),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 2, !is.na(var_mip))
+
+p_sub_var <- ggplot(sub_var_binned, aes(x = bin_center, y = var_mip)) +
+  geom_line(colour = "#2980B9", linewidth = 0.9) +
+  geom_point(colour = "#2980B9", size = 2) +
+  geom_vline(xintercept = threshold_line, linetype = "dashed", colour = "#C0392B", linewidth = 0.7) +
+  labs(
+    title = "Variance of MIP PC1 score by substitution-time bin",
+    subtitle = "5-minute bins (n ≥ 2); dashed line = 45-min candidate threshold",
+    x = "Substitution time bin centre (minutes)",
+    y = "Variance of MIP PC1 score"
+  ) +
+  theme_minimal(base_size = 11)
+
+sub_threshold_fig <- p_sub_scatter / p_sub_hist / p_sub_var +
+  plot_annotation(
+    title = "Identifying a playing-time threshold from substitution time",
+    theme = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+
+sub_distance_loess_fig <- wrap_plots(distance_loess_plots, ncol = 2) +
+  plot_annotation(
+    title = "Substitution time vs MIP distance metrics (LOESS)",
+    theme = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+
+ggsave(
+  file.path(stats_dir, "sub_time_threshold_figure.png"),
+  sub_threshold_fig,
+  width = 9,
+  height = 13,
+  dpi = 180,
+  bg = "white"
+)
+
+ggsave(
+  file.path(stats_dir, "sub_time_distance_loess_figure.png"),
+  sub_distance_loess_fig,
+  width = 11,
+  height = 9,
+  dpi = 180,
+  bg = "white"
+)
+```
+
+```{r sub_time_threshold_fig_show, fig.width=9, fig.height=13, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(sub_threshold_fig)
+```
+
+```{r sub_time_distance_loess_fig_show, fig.width=11, fig.height=9, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(sub_distance_loess_fig)
+```
+
+## Goals during MIP vs other three-minute periods
+
+Team goals are match-level events. Player MIPs on the same match often overlap in time, so analysing each player-MIP row separately would count the same goal multiple times. The unit of analysis is therefore the **team-match time window**, built from **all** rows in `ALL_mip_tactical.csv` (no starter / GPS-quality exclusions):
+
+1. Player MIP intervals on each match are merged into non-overlapping **MIP episodes** when they overlap or are separated by <=30 s (union of windows; `scored_mip` / `conceded_mip` flags are OR-ed within an episode).
+2. Regulation time (0-45 and 45-90 match-clock minutes) is partitioned into non-overlapping **3-minute non-MIP periods**, after removing any regulation-time coverage of MIP episodes. Residual free segments shorter than 3 minutes are dropped (not padded).
+3. **Added time:** MIPs that start in stoppage (match clock >45 in the first half or >90 overall) are retained as MIP episodes. They do not create extra non-MIP bins. Non-MIP tiling uses regulation halves only (15 bins per half before MIP removal), so stoppage is not treated as additional comparable non-MIP time without goal timestamps.
+4. Goal minutes are not available in `goals.xlsx` (match totals only). Non-MIP goal counts are therefore **match totals minus goals attributed to MIP episodes**, capped so MIP attributions cannot exceed `scored_match` / `conceded_match`. This assumes at most one scored (conceded) goal per period when converting counts to binomial period successes - reasonable for 3-minute windows.
+
+Models: binomial GLMM `cbind(n_with_goal, n_without) ~ period_type + (1 | match_date)`, `period_type` levels `non-MIP` (reference) vs `MIP`, fitted separately for scoring and conceding (`lme4::glmer`, binomial, bobyqa).
+
+```{r mip_goal_period_analysis, include=FALSE}
+parse_mmss_to_sec <- function(x) {
+  x <- str_remove(trimws(as.character(x)), "^'")
+  parts <- str_split(x, ":", simplify = TRUE)
+  if (ncol(parts) < 2) {
+    return(suppressWarnings(as.numeric(x)) * 60)
+  }
+  mm <- suppressWarnings(as.numeric(parts[, 1]))
+  ss <- suppressWarnings(as.numeric(parts[, 2]))
+  mm * 60 + ss
+}
+
+# Merge overlapping / near-adjacent player MIP intervals into team-match episodes
+merge_mip_episodes <- function(starts, ends, scored, conceded, gap_tol = 30) {
+  if (length(starts) == 0) {
+    return(tibble(
+      episode = integer(),
+      start_s = numeric(),
+      end_s = numeric(),
+      scored = integer(),
+      conceded = integer(),
+      n_players = integer()
+    ))
+  }
+  ord <- order(starts, ends)
+  starts <- starts[ord]
+  ends <- ends[ord]
+  scored <- scored[ord]
+  conceded <- conceded[ord]
+
+  out <- list()
+  eid <- 1L
+  ep_start <- starts[1]
+  ep_end <- ends[1]
+  ep_scored <- scored[1]
+  ep_conceded <- conceded[1]
+  ep_n <- 1L
+
+  flush_ep <- function() {
+    out[[eid]] <<- tibble(
+      episode = eid,
+      start_s = ep_start,
+      end_s = ep_end,
+      scored = as.integer(ep_scored > 0),
+      conceded = as.integer(ep_conceded > 0),
+      n_players = ep_n
+    )
+    eid <<- eid + 1L
+  }
+
+  if (length(starts) >= 2) {
+    for (i in 2:length(starts)) {
+      if (starts[i] <= ep_end + gap_tol) {
+        ep_end <- max(ep_end, ends[i])
+        ep_scored <- max(ep_scored, scored[i])
+        ep_conceded <- max(ep_conceded, conceded[i])
+        ep_n <- ep_n + 1L
+      } else {
+        flush_ep()
+        ep_start <- starts[i]
+        ep_end <- ends[i]
+        ep_scored <- scored[i]
+        ep_conceded <- conceded[i]
+        ep_n <- 1L
+      }
+    }
+  }
+  flush_ep()
+  bind_rows(out)
+}
+
+subtract_intervals <- function(h0, h1, cuts) {
+  if (nrow(cuts) == 0) {
+    return(tibble(start_s = h0, end_s = h1))
+  }
+  cuts <- cuts %>%
+    mutate(
+      start_s = pmax(start_s, h0),
+      end_s = pmin(end_s, h1)
+    ) %>%
+    filter(end_s > start_s) %>%
+    arrange(start_s, end_s)
+  if (nrow(cuts) == 0) {
+    return(tibble(start_s = h0, end_s = h1))
+  }
+  free <- list()
+  cur <- h0
+  for (i in seq_len(nrow(cuts))) {
+    a <- cuts$start_s[i]
+    b <- cuts$end_s[i]
+    if (a > cur) {
+      free[[length(free) + 1L]] <- tibble(start_s = cur, end_s = a)
+    }
+    cur <- max(cur, b)
+  }
+  if (cur < h1) {
+    free[[length(free) + 1L]] <- tibble(start_s = cur, end_s = h1)
+  }
+  if (length(free) == 0) {
+    return(tibble(start_s = numeric(), end_s = numeric()))
+  }
+  bind_rows(free)
+}
+
+tile_3min_periods <- function(free_tbl, dur = 180) {
+  if (nrow(free_tbl) == 0) {
+    return(tibble(start_s = numeric(), end_s = numeric()))
+  }
+  out <- list()
+  for (i in seq_len(nrow(free_tbl))) {
+    a <- free_tbl$start_s[i]
+    b <- free_tbl$end_s[i]
+    while ((b - a) >= (dur - 1e-8)) {
+      out[[length(out) + 1L]] <- tibble(start_s = a, end_s = a + dur)
+      a <- a + dur
+    }
+  }
+  if (length(out) == 0) {
+    return(tibble(start_s = numeric(), end_s = numeric()))
+  }
+  bind_rows(out)
+}
+
+HALF1_S <- c(0, 45 * 60)
+HALF2_S <- c(45 * 60, 90 * 60)
+
+goal_mip_raw <- tactical_raw %>%
+  mutate(
+    match_date = substr(match_id, 1, 10),
+    sub = as.integer(sub),
+    scored_mip = as.integer(scored_mip),
+    conceded_mip = as.integer(conceded_mip),
+    scored_match = as.integer(scored_match),
+    conceded_match = as.integer(conceded_match),
+    total_goals_match = as.integer(total_goals_match),
+    mip_start_s = parse_mmss_to_sec(mip_start_in_match_mmss),
+    mip_end_s = parse_mmss_to_sec(mip_end_in_match_mmss)
+  ) %>%
+  # Use all ALL_mip_tactical rows (no starter / GPS-quality exclusions)
+  filter(
+    !is.na(mip_start_s),
+    !is.na(mip_end_s),
+    mip_end_s > mip_start_s,
+    !is.na(scored_match),
+    !is.na(conceded_match)
+  )
+
+cat(
+  "Goals analysis MIP rows: ", nrow(goal_mip_raw),
+  " / ", nrow(tactical_raw), " in ALL_mip_tactical\n",
+  sep = ""
+)
+
+build_match_goal_periods <- function(df) {
+  md <- df$match_date[[1]]
+  scored_m <- df$scored_match[[1]]
+  conceded_m <- df$conceded_match[[1]]
+
+  eps <- merge_mip_episodes(
+    df$mip_start_s,
+    df$mip_end_s,
+    df$scored_mip,
+    df$conceded_mip
+  )
+
+  mip_periods <- eps %>%
+    transmute(
+      match_date = md,
+      period_type = "MIP",
+      start_s,
+      end_s,
+      scored,
+      conceded,
+      n_players
+    )
+
+  cuts <- eps %>%
+    transmute(
+      start_s = pmin(pmax(start_s, 0), 90 * 60),
+      end_s = pmin(pmax(end_s, 0), 90 * 60)
+    ) %>%
+    filter(end_s > start_s)
+
+  nonmip <- bind_rows(
+    tile_3min_periods(subtract_intervals(HALF1_S[1], HALF1_S[2], cuts)),
+    tile_3min_periods(subtract_intervals(HALF2_S[1], HALF2_S[2], cuts))
+  ) %>%
+    mutate(
+      match_date = md,
+      period_type = "non-MIP",
+      scored = NA_integer_,
+      conceded = NA_integer_,
+      n_players = NA_integer_
+    )
+
+  n_mip <- nrow(mip_periods)
+  n_mip_scored <- min(sum(mip_periods$scored), scored_m)
+  n_mip_conceded <- min(sum(mip_periods$conceded), conceded_m)
+
+  list(
+    periods = bind_rows(mip_periods, nonmip),
+    agg = tibble(
+      match_date = md,
+      scored_match = scored_m,
+      conceded_match = conceded_m,
+      n_mip = n_mip,
+      n_mip_scored = n_mip_scored,
+      n_mip_conceded = n_mip_conceded,
+      n_nonmip = nrow(nonmip),
+      n_nonmip_scored = scored_m - n_mip_scored,
+      n_nonmip_conceded = conceded_m - n_mip_conceded,
+      n_players = n_distinct(df$player_name)
+    )
+  )
+}
+
+goal_built <- goal_mip_raw %>%
+  group_split(match_date) %>%
+  map(build_match_goal_periods)
+
+goal_match_agg <- bind_rows(map(goal_built, "agg"))
+goal_periods <- bind_rows(map(goal_built, "periods"))
+
+# Match-aggregated binomial rows (avoids inventing which non-MIP bin had the goal)
+make_goal_model_data <- function(agg, outcome = c("scored", "conceded")) {
+  outcome <- match.arg(outcome)
+  # Assign before piping: `if/else %>% ...` only pipes the else branch in R
+  out <- if (outcome == "scored") {
+    bind_rows(
+      agg %>% transmute(
+        match_date,
+        period_type = "MIP",
+        n_with = n_mip_scored,
+        n = n_mip
+      ),
+      agg %>% transmute(
+        match_date,
+        period_type = "non-MIP",
+        n_with = n_nonmip_scored,
+        n = n_nonmip
+      )
+    )
+  } else {
+    bind_rows(
+      agg %>% transmute(
+        match_date,
+        period_type = "MIP",
+        n_with = n_mip_conceded,
+        n = n_mip
+      ),
+      agg %>% transmute(
+        match_date,
+        period_type = "non-MIP",
+        n_with = n_nonmip_conceded,
+        n = n_nonmip
+      )
+    )
+  }
+  out %>%
+    filter(n > 0, n_with >= 0, n_with <= n) %>%
+    mutate(
+      period_type = factor(period_type, levels = c("non-MIP", "MIP")),
+      n_without = n - n_with
+    )
+}
+
+goal_model_scored <- make_goal_model_data(goal_match_agg, "scored")
+goal_model_conceded <- make_goal_model_data(goal_match_agg, "conceded")
+
+fit_goal_glmm <- function(dat) {
+  glmer(
+    cbind(n_with, n_without) ~ period_type + (1 | match_date),
+    data = dat,
+    family = binomial,
+    control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  )
+}
+
+goal_glmm_scored <- fit_goal_glmm(goal_model_scored)
+goal_glmm_conceded <- fit_goal_glmm(goal_model_conceded)
+
+summarise_goal_glmm <- function(model, outcome_label, dat) {
+  sm <- summary(model)$coefficients
+  # period_typeMIP row
+  rn <- grep("period_type", rownames(sm), value = TRUE)
+  stopifnot(length(rn) == 1L)
+  est <- sm[rn, "Estimate"]
+  se <- sm[rn, "Std. Error"]
+  z <- sm[rn, "z value"]
+  p <- sm[rn, "Pr(>|z|)"]
+  or <- exp(est)
+  or_lo <- exp(est - 1.96 * se)
+  or_hi <- exp(est + 1.96 * se)
+
+  # Marginal probabilities on response scale (RE = 0)
+  b0 <- sm["(Intercept)", "Estimate"]
+  p_non <- plogis(b0)
+  p_mip <- plogis(b0 + est)
+  se0 <- sm["(Intercept)", "Std. Error"]
+  # delta-method-ish Wald on probability scale for display
+  p_non_lo <- plogis(b0 - 1.96 * se0)
+  p_non_hi <- plogis(b0 + 1.96 * se0)
+  # MIP: var(b0+b1) ≈ se0^2 + se1^2 + 2*cov; use vcov
+  V <- as.matrix(vcov(model))
+  se_mip <- sqrt(V["(Intercept)", "(Intercept)"] + V[rn, rn] + 2 * V["(Intercept)", rn])
+  p_mip_lo <- plogis(b0 + est - 1.96 * se_mip)
+  p_mip_hi <- plogis(b0 + est + 1.96 * se_mip)
+
+  desc <- dat %>%
+    group_by(period_type) %>%
+    summarise(
+      n_periods = sum(n),
+      n_with_goal = sum(n_with),
+      pct_with_goal = 100 * n_with_goal / n_periods,
+      .groups = "drop"
+    )
+
+  list(
+    desc = desc %>% mutate(outcome = outcome_label, .before = 1),
+    coef = tibble(
+      outcome = outcome_label,
+      term = "MIP vs non-MIP",
+      odds_ratio = or,
+      conf.low = or_lo,
+      conf.high = or_hi,
+      estimate_log_or = est,
+      std.error = se,
+      statistic = z,
+      p.value = p
+    ),
+    probs = tibble(
+      outcome = outcome_label,
+      period_type = c("non-MIP", "MIP"),
+      prob = c(p_non, p_mip),
+      conf.low = c(p_non_lo, p_mip_lo),
+      conf.high = c(p_non_hi, p_mip_hi)
+    ),
+    fit = tibble(
+      outcome = outcome_label,
+      n_matches = ngrps(model)[["match_date"]],
+      n_rows = nobs(model),
+      AIC = AIC(model),
+      re_sd_match = as.numeric(VarCorr(model)$match_date)^0.5,
+      converged = is.null(model@optinfo$conv$lme4$messages)
+    )
+  )
+}
+
+goal_sum_scored <- summarise_goal_glmm(
+  goal_glmm_scored, "Scored", goal_model_scored
+)
+goal_sum_conceded <- summarise_goal_glmm(
+  goal_glmm_conceded, "Conceded", goal_model_conceded
+)
+
+goal_desc_table <- bind_rows(goal_sum_scored$desc, goal_sum_conceded$desc)
+goal_or_table <- bind_rows(goal_sum_scored$coef, goal_sum_conceded$coef)
+goal_prob_table <- bind_rows(goal_sum_scored$probs, goal_sum_conceded$probs)
+goal_fit_table <- bind_rows(goal_sum_scored$fit, goal_sum_conceded$fit)
+
+# Results table combining descriptives + model
+goal_results_table <- goal_desc_table %>%
+  mutate(period_type = as.character(period_type)) %>%
+  left_join(
+    goal_prob_table %>% mutate(period_type = as.character(period_type)),
+    by = c("outcome", "period_type")
+  ) %>%
+  left_join(
+    goal_or_table %>%
+      select(outcome, odds_ratio, conf.low_or = conf.low, conf.high_or = conf.high, p.value),
+    by = "outcome"
+  )
+
+# Intuitive 30-period benchmark (not a substitute for the GLMM)
+n_matches_goals <- nrow(goal_match_agg)
+goal_benchmark <- tibble(
+  outcome = c("Scored", "Conceded"),
+  total_goals = c(
+    sum(goal_match_agg$scored_match),
+    sum(goal_match_agg$conceded_match)
+  ),
+  expected_per_3min = c(
+    sum(goal_match_agg$scored_match) / (n_matches_goals * 30),
+    sum(goal_match_agg$conceded_match) / (n_matches_goals * 30)
+  ),
+  observed_mip_rate = c(
+    sum(goal_match_agg$n_mip_scored) / sum(goal_match_agg$n_mip),
+    sum(goal_match_agg$n_mip_conceded) / sum(goal_match_agg$n_mip)
+  )
+) %>%
+  mutate(
+    ratio_vs_expected = observed_mip_rate / expected_per_3min
+  )
+
+# Null GLM without random effect (diagnostic comparison)
+goal_glm_scored <- glm(
+  cbind(n_with, n_without) ~ period_type,
+  data = goal_model_scored,
+  family = binomial
+)
+goal_glm_conceded <- glm(
+  cbind(n_with, n_without) ~ period_type,
+  data = goal_model_conceded,
+  family = binomial
+)
+
+goal_diag_table <- tibble(
+  outcome = c("Scored", "Conceded"),
+  glmm_AIC = c(AIC(goal_glmm_scored), AIC(goal_glmm_conceded)),
+  glm_AIC = c(AIC(goal_glm_scored), AIC(goal_glm_conceded)),
+  re_sd_match = goal_fit_table$re_sd_match,
+  max_grad = c(
+    max(abs(goal_glmm_scored@optinfo$derivs$gradient)),
+    max(abs(goal_glmm_conceded@optinfo$derivs$gradient))
+  )
+)
+
+write_csv(goal_match_agg, file.path(stats_dir, "mip_goal_match_aggregation.csv"))
+write_csv(goal_periods, file.path(stats_dir, "mip_goal_periods_long.csv"))
+write_csv(goal_results_table, file.path(stats_dir, "mip_goal_results_table.csv"))
+write_csv(goal_or_table, file.path(stats_dir, "mip_goal_odds_ratios.csv"))
+write_csv(goal_prob_table, file.path(stats_dir, "mip_goal_model_probabilities.csv"))
+write_csv(goal_benchmark, file.path(stats_dir, "mip_goal_30period_benchmark.csv"))
+write_csv(goal_diag_table, file.path(stats_dir, "mip_goal_model_diagnostics.csv"))
+write_csv(goal_fit_table, file.path(stats_dir, "mip_goal_model_fit.csv"))
+
+p_goal_probs <- goal_prob_table %>%
+  mutate(
+    period_type = factor(period_type, levels = c("non-MIP", "MIP")),
+    outcome = factor(outcome, levels = c("Scored", "Conceded"))
+  ) %>%
+  ggplot(aes(x = period_type, y = prob, colour = period_type)) +
+  geom_pointrange(
+    aes(ymin = conf.low, ymax = conf.high),
+    linewidth = 0.7,
+    fatten = 3
+  ) +
+  facet_wrap(~ outcome, nrow = 1) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    labels = function(x) paste0(round(100 * x), "%")
+  ) +
+  scale_colour_manual(values = c("non-MIP" = "grey45", "MIP" = "#C0392B")) +
+  labs(
+    title = "Estimated probability of ≥1 goal in a 3-minute period",
+    subtitle = "Binomial GLMM: period_type + (1 | match); 95% Wald CI on probability scale (RE = 0)",
+    x = NULL,
+    y = "Probability",
+    colour = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+ggsave(
+  file.path(stats_dir, "mip_goal_probability_figure.png"),
+  p_goal_probs,
+  width = 8,
+  height = 4.5,
+  dpi = 180,
+  bg = "white"
+)
+```
+
+```{r mip_goal_results_table, results="asis"}
+goal_results_table %>%
+  transmute(
+    Outcome = outcome,
+    `Period type` = period_type,
+    `N periods` = n_periods,
+    `N with goal` = n_with_goal,
+    `Pct with goal` = sprintf("%.1f", pct_with_goal),
+    `Model P` = sprintf("%.3f", prob),
+    `P 95% CI` = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+    `OR (MIP vs non-MIP)` = sprintf("%.2f", odds_ratio),
+    `OR 95% CI` = sprintf("[%.2f, %.2f]", conf.low_or, conf.high_or),
+    p = format_p_value(p.value)
+  ) %>%
+  kable(
+    caption = paste0(
+      "Goals in MIP vs non-MIP 3-minute periods (team-match episodes; ",
+      n_matches_goals, " matches). OR from binomial GLMM with random intercept for match. ",
+      "OR and p are repeated on both period-type rows for each outcome."
+    )
+  )
+```
+
+```{r mip_goal_benchmark_table, results="asis"}
+goal_benchmark %>%
+  transmute(
+    Outcome = outcome,
+    `Total goals` = total_goals,
+    `Expected rate if uniform over 30 x 3-min bins` = sprintf("%.3f", expected_per_3min),
+    `Observed MIP period rate` = sprintf("%.3f", observed_mip_rate),
+    `MIP / expected` = sprintf("%.2f", ratio_vs_expected)
+  ) %>%
+  kable(
+    caption = paste0(
+      "Descriptive 30-period benchmark only: in a 90-minute match there are 30 non-overlapping ",
+      "3-minute bins, so a uniform goal rate equals total goals / (matches x 30). ",
+      "This is not a substitute for the mixed-model comparison."
+    )
+  )
+```
+```{r mip_goal_diagnostics_table, results="asis"}
+goal_diag_table %>%
+  transmute(
+    Outcome = outcome,
+    `GLMM AIC` = sprintf("%.1f", glmm_AIC),
+    `GLM AIC (no RE)` = sprintf("%.1f", glm_AIC),
+    `RE SD (match)` = sprintf("%.3f", re_sd_match),
+    `Max |gradient|` = sprintf("%.2e", max_grad)
+  ) %>%
+  kable(
+    caption = "Model diagnostics: binomial GLMM vs intercept-only-RE-free GLM; random-intercept SD for match; optimiser gradient."
+  )
+```
+
+```{r mip_goal_prob_fig_show, fig.width=8, fig.height=4.5, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(p_goal_probs)
+```
+
+## Score state at MIP onset
+
+Exposure-adjusted MIP index by Crystal Palace U21 score state (Trailing / Drawing / Leading), using **all** player-MIP rows in `ALL_mip_tactical.csv` (n = 188; no starter / GPS-quality exclusions). Match score-state minutes are weighted by the number of player-MIPs in that match. Index = (MIP share / exposure share) x 100; 100 = frequency expected from exposure time. 95% CIs from match-level cluster bootstrap (2,000 resamples).
+
+```{r score_state_mip_index_run, include=FALSE, cache=TRUE, cache.extra=file.info(c("E:/Work/R Projects/GPS/R/score_state_mip_index_visual.R", "E:/Work/R Projects/GPS/score_state.xlsx", "E:/Work/R Projects/GPS/Data_Tactical/ALL_mip_tactical.csv"))$mtime}
+source("E:/Work/R Projects/GPS/R/score_state_mip_index_visual.R", local = FALSE)
+```
+
+```{r score_state_mip_index_table, results="asis"}
+score_state_mip_results %>%
+  transmute(
+    `Score state` = score_state,
+    `Exposure min (weighted)` = exposure_minutes,
+    `Exposure %` = sprintf("%.1f", exposure_share_pct),
+    `N MIPs` = n_mip,
+    `MIP %` = sprintf("%.1f", mip_share_pct),
+    `MIP Index` = sprintf("%.0f", mip_index),
+    `95% CI` = sprintf("[%.0f, %.0f]", ci_low_95, ci_high_95)
+  ) %>%
+  kable(
+    caption = paste0(
+      "Exposure-adjusted MIP onset index by score state (n matches = ",
+      score_state_mip_n_matches, "; n unique MIPs = ", score_state_mip_n_mips,
+      "). Player-weighted exposure; match-level bootstrap 95% CIs."
+    )
+  )
+```
+
+```{r score_state_mip_index_fig, fig.width=10, fig.height=5.2, echo=FALSE, warning=FALSE, message=FALSE, fig.show="asis", results="asis"}
+print(score_state_mip_plot)
+```
+
+```{r score_state_mip_index_text, results="asis", echo=FALSE}
+cat(score_state_mip_results_sentence)
+```
